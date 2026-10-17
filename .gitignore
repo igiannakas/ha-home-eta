@@ -1,0 +1,15 @@
+.DS_Store
+
+# Python and tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Backtest exports contain real location history; never commit them
+history*.json
+*.history.json

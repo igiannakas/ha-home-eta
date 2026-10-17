@@ -1,0 +1,13 @@
+{
+  "domain": "home_eta",
+  "name": "Home ETA",
+  "codeowners": ["@igiannakas"],
+  "config_flow": true,
+  "dependencies": ["person", "zone"],
+  "documentation": "https://github.com/igiannakas/ha-home-eta",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/igiannakas/ha-home-eta/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}

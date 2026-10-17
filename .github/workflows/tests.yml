@@ -1,0 +1,48 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, types and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements_test.txt
+      - name: Install
+        run: pip install -r requirements_test.txt
+      - name: Ruff
+        run: |
+          ruff format --check .
+          ruff check .
+      - name: Mypy
+        run: mypy custom_components/home_eta scripts/backtest.py
+      - name: Pytest
+        run: pytest --cov=custom_components/home_eta --cov-report=term-missing
+
+  backtest:
+    name: Backtest on Python 3.11 without Home Assistant
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Compile the core and the script
+        run: python -I -m compileall -q custom_components/home_eta/core scripts
+      - name: Replay the synthetic sample
+        run: >
+          python -I scripts/backtest.py
+          --input tests/fixtures/backtest_sample.json
+          --zone 51.4779,-0.0015,100

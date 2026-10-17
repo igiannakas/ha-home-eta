@@ -1,0 +1,15 @@
+reset_history:
+  fields:
+    person:
+      selector:
+        entity:
+          domain: person
+          multiple: true
+
+export_history:
+  fields:
+    person:
+      selector:
+        entity:
+          domain: person
+          multiple: true
