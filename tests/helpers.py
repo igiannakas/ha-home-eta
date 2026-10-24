@@ -13,9 +13,7 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.home_eta.const import (
-    CONF_ENABLE_HISTORICAL,
     CONF_ENTRY_TYPE,
-    CONF_IGNORED_ZONES,
     CONF_MEMBERS,
     CONF_PERSON,
     CONF_ZONE,
@@ -23,6 +21,7 @@ from custom_components.home_eta.const import (
     ENTRY_TYPE_GROUP,
     ENTRY_TYPE_PERSON,
 )
+from custom_components.home_eta.migration import CONFIG_MINOR_VERSION
 from tests.sim import HOME_LAT, HOME_LON, HOME_RADIUS_M, to_latlon
 
 __all__ = ["HOME_LAT", "HOME_LON", "HOME_RADIUS_M"]
@@ -38,27 +37,25 @@ def person_entry(
     zone: str = "zone.home",
     options: dict[str, Any] | None = None,
 ) -> MockConfigEntry:
-    """Return a person config entry."""
+    """Return a person config entry (current version; defaults unless given)."""
     return MockConfigEntry(
         domain=DOMAIN,
         title=title or person.split(".")[1].title(),
         data={CONF_ENTRY_TYPE: ENTRY_TYPE_PERSON, CONF_PERSON: person, CONF_ZONE: zone},
-        options={
-            CONF_ENABLE_HISTORICAL: False,
-            CONF_IGNORED_ZONES: [],
-            **(options or {}),
-        },
+        options=dict(options or {}),
         unique_id=f"{person}|{zone}",
+        minor_version=CONFIG_MINOR_VERSION,
     )
 
 
 def group_entry(members: list[str], *, title: str = "Home ETA") -> MockConfigEntry:
-    """Return a first-arrival group entry."""
+    """Return a group entry (current version)."""
     return MockConfigEntry(
         domain=DOMAIN,
         title=title,
         data={CONF_ENTRY_TYPE: ENTRY_TYPE_GROUP, CONF_ZONE: "zone.home"},
         options={CONF_MEMBERS: members},
+        minor_version=CONFIG_MINOR_VERSION,
     )
 
 

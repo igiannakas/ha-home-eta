@@ -2,12 +2,11 @@
 
 ``PersonRuntime`` feeds a person's state changes into a ``PersonTracker`` and
 publishes a ``PersonView`` to its entities. ``GroupRuntime`` watches the
-person runtimes for one zone and picks the first arrival.
+person runtimes for one zone and combines them.
 """
 
 from __future__ import annotations
 
-import asyncio
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -20,7 +19,6 @@ from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
     ATTR_LATITUDE,
     ATTR_LONGITUDE,
-    ATTR_UNIT_OF_MEASUREMENT,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
@@ -45,21 +43,16 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 from homeassistant.helpers.start import async_at_started
-from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.hass_dict import HassKey
 
 from .const import (
     ADVANCED_PARAMS,
-    CONF_ACTIVITY_ENTITY,
     CONF_ADVANCED,
-    CONF_ENABLE_HISTORICAL,
-    CONF_IGNORED_ZONES,
     CONF_MEMBERS,
     CONF_NEAR_HOME_FADE_AFTER_MIN,
     CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
-    CONF_REFERENCE_ETA_ENTITY,
     CONF_ZONE,
     DEFAULT_NEAR_HOME_FADE_AFTER_MIN,
     DEFAULT_NEAR_HOME_RADIUS_M,
@@ -69,25 +62,16 @@ from .const import (
     NEAR_HOME_FADE_MIN,
     NEAR_HOME_FULL_M,
     SIGNAL_PERSON_UPDATED,
-    STORE_VERSION,
     TICK_INTERVAL,
 )
-from .core.approach import ApproachState, Transition
-from .core.homeward import (
-    HomewardReason,
-    HomewardRestore,
-    NearHomeConfig,
-    SpeedSource,
-    near_home,
-)
-from .core.kinematic import Target
+from .core.homeward import HomewardRestore, NearHomeConfig
+from .core.kinematic import FixOutcome, Target
 from .core.params import EstimatorParams
 from .core.tracker import (
     PersonReport,
     PersonTracker,
     TrackerConfig,
     TrackerSnapshot,
-    UpdateResult,
     build_report,
 )
 
@@ -119,6 +103,20 @@ def params_from_options(options: Mapping[str, Any]) -> EstimatorParams:
     return EstimatorParams(**overrides)
 
 
+def near_home_config_from_options(options: Mapping[str, Any]) -> NearHomeConfig:
+    """Build a person's near-home settings from their options."""
+    radius = float(options.get(CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M))
+    fade_after = float(
+        options.get(CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN)
+    )
+    return NearHomeConfig(
+        radius_m=radius,
+        full_m=NEAR_HOME_FULL_M,
+        fade_after_s=None if fade_after == 0 else fade_after * 60.0,
+        fade_s=NEAR_HOME_FADE_MIN * 60.0,
+    )
+
+
 def target_from_state(state: State | None) -> Target | None:
     """Return the target described by a zone state, if usable."""
     if state is None or state.state == STATE_UNAVAILABLE:
@@ -132,20 +130,6 @@ def target_from_state(state: State | None) -> Target | None:
     return Target(latitude, longitude, radius)
 
 
-def near_home_config_from_options(options: Mapping[str, Any]) -> NearHomeConfig:
-    """Build a group's near-home settings from its options."""
-    radius = float(options.get(CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M))
-    fade_after = float(
-        options.get(CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN)
-    )
-    return NearHomeConfig(
-        radius_m=radius,
-        full_m=NEAR_HOME_FULL_M,
-        fade_after_s=None if fade_after == 0 else fade_after * 60.0,
-        fade_s=NEAR_HOME_FADE_MIN * 60.0,
-    )
-
-
 def friendly_name(hass: HomeAssistant, entity_id: str) -> str:
     """Return an entity's friendly name, or its id."""
     state = hass.states.get(entity_id)
@@ -154,17 +138,35 @@ def friendly_name(hass: HomeAssistant, entity_id: str) -> str:
     return entity_id
 
 
+def minutes_until(arrival: float, now: float) -> int:
+    """Return whole minutes from ``now`` until ``arrival``, never negative."""
+    return max(0, round((arrival - now) / 60.0))
+
+
 @dataclass(frozen=True, slots=True)
 class PersonView:
     """What a person's entities publish."""
 
     available: bool
     snapshot: TrackerSnapshot | None
+    """None until the person's whereabouts are first known."""
     threshold_min: float
-    other_zone_names: tuple[str, ...] = ()
-    activity: str | None = None
-    reference_eta: str | None = None
-    reference_eta_unit: str | None = None
+
+    @property
+    def expected_home(self) -> datetime | None:
+        """Return the expected arrival while heading home."""
+        snap = self.snapshot
+        if snap is None or (arrival := snap.expected_home) is None:
+            return None
+        return dt_util.utc_from_timestamp(arrival)
+
+    @property
+    def minutes_to_home(self) -> int | None:
+        """Return whole minutes until the expected arrival while heading home."""
+        snap = self.snapshot
+        if snap is None or (arrival := snap.expected_home) is None:
+            return None
+        return minutes_until(arrival, snap.now)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,26 +190,17 @@ class PersonRuntime:
         self.entry = entry
         self.person_id: str = entry.data[CONF_PERSON]
         self.zone_id: str = entry.data[CONF_ZONE]
-        options = entry.options
-        self.activity_entity: str | None = options.get(CONF_ACTIVITY_ENTITY)
-        self.reference_entity: str | None = options.get(CONF_REFERENCE_ETA_ENTITY)
-        self.historical_enabled = bool(options.get(CONF_ENABLE_HISTORICAL, False))
         try:
-            params = params_from_options(options)
+            self.config = TrackerConfig(
+                params_from_options(entry.options),
+                near_home_config_from_options(entry.options),
+            )
         except (TypeError, ValueError) as err:
             raise ConfigEntryError(
                 translation_domain=DOMAIN,
                 translation_key="invalid_options",
                 translation_placeholders={"error": str(err)},
             ) from err
-        self.config = TrackerConfig(
-            params,
-            frozenset(options.get(CONF_IGNORED_ZONES) or ()),
-            historical=self.historical_enabled,
-        )
-        self._store: Store[dict[str, Any]] = Store(
-            hass, STORE_VERSION, store_key(entry.entry_id)
-        )
         self._tracker: PersonTracker | None = None
         self._listeners: list[CALLBACK_TYPE] = []
         self._unsubscribes: list[CALLBACK_TYPE] = []
@@ -216,7 +209,6 @@ class PersonRuntime:
         self._has_report = False
         """A usable report of the person has arrived (until then: no data)."""
         self._fix_log: deque[FixLogEntry] = deque(maxlen=FIX_LOG_SIZE)
-        self._saves: set[asyncio.Task[None]] = set()
         self.view = PersonView(False, None, 0.0)
 
     # -- lifecycle -------------------------------------------------------
@@ -234,11 +226,11 @@ class PersonRuntime:
             identifiers={(DOMAIN, self.entry.entry_id)},
             name=self.entry.title,
             entry_type=DeviceEntryType.SERVICE,
-            model="Person ETA",
+            model="Person",
         )
 
     async def async_start(self) -> None:
-        """Load history, build the tracker and subscribe to changes."""
+        """Build the tracker and subscribe to changes."""
         hass = self.hass
         target = target_from_state(hass.states.get(self.zone_id))
         if target is None:
@@ -250,27 +242,12 @@ class PersonRuntime:
                 translation_key="zone_not_ready",
                 translation_placeholders={"zone": self.zone_id},
             )
-        if not self.historical_enabled:
-            # Learning is off: learned trips are personal location history,
-            # so they are not kept.
-            await self._store.async_remove()
-        stored: object = (
-            await self._store.async_load() if self.historical_enabled else None
-        )
-        if stored is not None and not isinstance(stored, Mapping):
-            _LOGGER.warning(
-                "%s: ignoring learned history in an unexpected format", self.person_id
-            )
-            stored = None
 
         person_state = hass.states.get(self.person_id)
         enclosing = self._enclosing_zones()
         report = self._report(person_state, enclosing)
         self._tracker = PersonTracker(
-            self.config,
-            target,
-            stored,
-            at_target=report is not None and report.in_target,
+            self.config, target, at_target=report is not None and report.in_target
         )
         self._tracker.set_rings(self._rings(enclosing))
         if report is not None:
@@ -284,20 +261,16 @@ class PersonRuntime:
         # The zone is valid now; clear a warning left from an earlier run.
         ir.async_delete_issue(hass, DOMAIN, f"zone_missing_{self.entry.entry_id}")
 
-        watched = [self.person_id]
         self._unsubscribes.append(
-            async_track_state_change_event(hass, watched, self._handle_person_event)
+            async_track_state_change_event(
+                hass, [self.person_id], self._handle_person_event
+            )
         )
         self._unsubscribes.append(
             async_track_state_change_event(
                 hass, [self.zone_id], self._handle_zone_event
             )
         )
-        extras = [e for e in (self.activity_entity, self.reference_entity) if e]
-        if extras:
-            self._unsubscribes.append(
-                async_track_state_change_event(hass, extras, self._handle_extra_event)
-            )
         self._unsubscribes.append(
             async_track_time_interval(
                 hass,
@@ -312,15 +285,13 @@ class PersonRuntime:
         self._refresh()
 
     async def async_stop(self) -> None:
-        """Unsubscribe and finish pending history writes."""
+        """Unsubscribe and leave the registry of loaded people."""
         while self._unsubscribes:
             self._unsubscribes.pop()()
         persons = self.hass.data[DATA_KEY].persons
         if persons.get((self.person_id, self.zone_id)) is self:
             del persons[(self.person_id, self.zone_id)]
             self._signal_group()
-        if self._saves:
-            await asyncio.gather(*self._saves)
 
     @callback
     def async_add_listener(self, update: CALLBACK_TYPE) -> CALLBACK_TYPE:
@@ -337,7 +308,7 @@ class PersonRuntime:
 
     @callback
     def _handle_started(self, _hass: HomeAssistant) -> None:
-        """Start using fixes for speed once restored states are behind us."""
+        """Start using fixes once restored states are behind us."""
         self._kinematics_enabled = True
 
     @callback
@@ -348,13 +319,11 @@ class PersonRuntime:
         report = self._report(new_state, enclosing)
         if report is not None and new_state is not None:
             self.tracker.set_rings(self._rings(enclosing))
-            result = self.tracker.update(
+            outcome = self.tracker.update(
                 report, use_for_kinematics=self._kinematics_enabled
             )
             self._has_report = True
-            self._log_update(new_state, report, result)
-            if result.learned_samples:
-                self._save_history()
+            self._log_fix(new_state, report, outcome)
         self._refresh()
 
     @callback
@@ -366,13 +335,7 @@ class PersonRuntime:
         ir.async_delete_issue(self.hass, DOMAIN, f"zone_missing_{self.entry.entry_id}")
         if target != self.tracker.target:
             _LOGGER.debug("%s: target zone %s changed", self.person_id, self.zone_id)
-            if self.tracker.set_target(target, event.time_fired.timestamp()):
-                _LOGGER.info(
-                    "%s: %s moved; learned trips were forgotten",
-                    self.person_id,
-                    self.zone_id,
-                )
-                self._save_history()
+            self.tracker.set_target(target, event.time_fired.timestamp())
             self._refresh()
 
     @callback
@@ -388,14 +351,8 @@ class PersonRuntime:
         )
 
     @callback
-    def _handle_extra_event(self, _event: Event[EventStateChangedData]) -> None:
-        self._refresh()
-
-    @callback
     def _handle_tick(self, now: datetime) -> None:
-        transition = self.tracker.tick(now.timestamp())
-        if transition is not None:
-            self._log_transition(transition)
+        self.tracker.tick(now.timestamp())
         self._refresh(now)
 
     # -- controls ----------------------------------------------------------
@@ -404,73 +361,30 @@ class PersonRuntime:
     def set_threshold(self, minutes: float) -> None:
         """Set the arriving-soon threshold (from the number entity)."""
         self.tracker.set_threshold(minutes * 60.0)
-        transition = self.tracker.tick(dt_util.utcnow().timestamp())
-        if transition is not None:
-            self._log_transition(transition)
+        self.tracker.tick(dt_util.utcnow().timestamp())
         self._refresh()
 
     @callback
-    def restore_state(
-        self,
-        state: ApproachState | None,
-        since: float,
-        last_heard: float,
-        homeward: HomewardRestore | None = None,
-    ) -> None:
-        """Restore the approach state, trip home and stay saved before a restart.
+    def restore_homeward(self, data: HomewardRestore) -> None:
+        """Restore the trip home and stay saved before a restart or reload.
 
-        The approach state only when the person was heard from within the
-        stale period: the silence before the restart counts, so a restored
-        state can never outlive it, however often Home Assistant restarts or
-        reloads. A trip home within the longest ETA; the overdue rule then
-        ends it at once if it should have finished by now. A stay whenever:
-        the next fix elsewhere ends it.
+        A trip home only if the person was heard from within the longest trip
+        home; the overdue rule then ends it at once if it should have finished
+        by now. A stay whenever: the next fix elsewhere ends it.
         """
         params = self.config.params
         now = dt_util.utcnow().timestamp()
-        age = now - last_heard
+        age = now - data.last_heard
         if age < -params.clock_step_back_s:
+            # Saved "in the future": the clock was wrong then or is now.
             return
-        changed = False
-        if (
-            state is not None
-            and age <= params.stale_after_s
-            and self.tracker.restore_state(state, since, last_heard)
-        ):
-            _LOGGER.debug("%s: restored approach state %s", self.person_id, state)
-            changed = True
-        if homeward is not None and age > params.max_eta_s:
-            # Longer ago than any trip home could take; a stay may still hold.
-            homeward = replace(homeward, trip=None)
-        if (
-            homeward is not None
-            and (homeward.trip is not None or homeward.stay is not None)
-            and self.tracker.restore_homeward(homeward, last_heard, now)
-        ):
+        if age > params.max_eta_s:
+            data = replace(data, trip=None)
+        if data.trip is None and data.stay is None:
+            return
+        if self.tracker.restore_homeward(data, data.last_heard, now):
             _LOGGER.debug("%s: restored the trip home or stay", self.person_id)
-            changed = True
-        if changed:
             self._refresh()
-
-    async def async_reset_history(self) -> None:
-        """Forget learned history (service call)."""
-        historical = self.tracker.historical
-        if historical is None:
-            return
-        historical.reset()
-        await self._store.async_save(historical.as_dict())
-        self._refresh()
-
-    def export_history(self) -> dict[str, Any]:
-        """Return learned history for the export service."""
-        historical = self.tracker.historical
-        return {
-            "person": self.person_id,
-            "zone": self.zone_id,
-            "entry_id": self.entry.entry_id,
-            "enabled": historical is not None,
-            **(historical.export() if historical is not None else {}),
-        }
 
     # -- internals ---------------------------------------------------------
 
@@ -517,10 +431,9 @@ class PersonRuntime:
                 },
             )
 
-    def _log_update(
-        self, state: State, report: PersonReport, result: UpdateResult
+    def _log_fix(
+        self, state: State, report: PersonReport, outcome: FixOutcome | None
     ) -> None:
-        outcome = result.outcome
         self._fix_log.append(
             FixLogEntry(
                 at=report.timestamp,
@@ -533,62 +446,46 @@ class PersonRuntime:
         )
         if outcome is not None:
             _LOGGER.debug(
-                "%s: fix %s, %.0f m from %s, sample %s m/s, filtered %s m/s",
+                "%s: fix %s, %s m from %s",
                 self.person_id,
                 outcome.verdict,
-                outcome.distance_m if outcome.distance_m is not None else -1.0,
+                "n/a" if outcome.distance_m is None else f"{outcome.distance_m:.0f}",
                 self.zone_id,
-                _fmt(outcome.speed_sample_mps),
-                _fmt(self.tracker.closing_speed_mps),
             )
-        if result.transition is not None:
-            self._log_transition(result.transition)
-        if result.learned_samples:
-            _LOGGER.debug(
-                "%s: learned %d samples from the trip",
-                self.person_id,
-                result.learned_samples,
-            )
-
-    def _log_transition(self, transition: Transition) -> None:
-        _LOGGER.debug(
-            "%s: %s -> %s (%s)",
-            self.person_id,
-            transition.previous,
-            transition.current,
-            transition.reason,
-        )
-
-    @callback
-    def _save_history(self) -> None:
-        historical = self.tracker.historical
-        if historical is None:
-            return
-        task = self.hass.async_create_task(
-            self._store.async_save(historical.as_dict()),
-            f"{DOMAIN} save history {self.person_id}",
-        )
-        self._saves.add(task)
-        task.add_done_callback(self._saves.discard)
 
     @callback
     def _refresh(self, now: datetime | None = None) -> None:
         moment = (now or dt_util.utcnow()).timestamp()
         snapshot = self.tracker.snapshot(moment) if self._has_report else None
+        self._log_changes(self.view.snapshot, snapshot)
         self.view = PersonView(
             available=bool(self._person_present),
             snapshot=snapshot,
             threshold_min=self.tracker.threshold_s / 60.0,
-            other_zone_names=()
-            if snapshot is None
-            else tuple(friendly_name(self.hass, zone) for zone in snapshot.other_zones),
-            activity=self._entity_state(self.activity_entity),
-            reference_eta=self._entity_state(self.reference_entity),
-            reference_eta_unit=self._entity_unit(self.reference_entity),
         )
         for update in list(self._listeners):
             update()
         self._signal_group()
+
+    def _log_changes(
+        self, before: TrackerSnapshot | None, after: TrackerSnapshot | None
+    ) -> None:
+        if after is None:
+            return
+        homeward = after.homeward
+        if before is None or before.heading_home != after.heading_home:
+            _LOGGER.debug(
+                "%s: heading home %s (%s)",
+                self.person_id,
+                "on" if homeward.heading else "off",
+                homeward.reason,
+            )
+        if before is None or before.arriving_soon != after.arriving_soon:
+            _LOGGER.debug(
+                "%s: arriving soon %s",
+                self.person_id,
+                "on" if after.arriving_soon else "off",
+            )
 
     @callback
     def _signal_group(self) -> None:
@@ -596,23 +493,10 @@ class PersonRuntime:
             self.hass, SIGNAL_PERSON_UPDATED.format(zone=self.zone_id)
         )
 
-    def _entity_state(self, entity_id: str | None) -> str | None:
-        if entity_id is None:
-            return None
-        state = self.hass.states.get(entity_id)
-        if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-            return None
-        return state.state
-
-    def _entity_unit(self, entity_id: str | None) -> str | None:
-        if entity_id is None or (state := self.hass.states.get(entity_id)) is None:
-            return None
-        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
-        return None if unit is None else str(unit)
-
     def diagnostics(self) -> dict[str, Any]:
         """Return runtime internals with coordinates rounded."""
         decimals = DIAGNOSTICS_COORDINATE_DECIMALS
+        near = self.config.near_home
         return {
             "person": self.person_id,
             "zone": self.zone_id,
@@ -622,7 +506,12 @@ class PersonRuntime:
             "params": {
                 key: getattr(self.config.params, key) for key in ADVANCED_PARAMS
             },
-            "ignored_zones": sorted(self.config.ignored_zones),
+            "near_home": {
+                "radius_m": near.radius_m,
+                "full_m": near.full_m,
+                "fade_after_s": near.fade_after_s,
+                "fade_s": near.fade_s,
+            },
             "tracker": self.tracker.diagnostics(),
             "recent_fixes": [
                 {
@@ -639,28 +528,13 @@ class PersonRuntime:
 
 
 @dataclass(frozen=True, slots=True)
-class Candidate:
-    """A member who is on the way."""
-
-    person_id: str
-    name: str
-    arrival: datetime
-    minutes: int
-    confidence: str | None
-    state: ApproachState
-
-
-@dataclass(frozen=True, slots=True)
-class HomewardCandidate:
+class HeadingHome:
     """A member who is heading home."""
 
     person_id: str
     name: str
     arrival: datetime
     minutes: int
-    reason: HomewardReason
-    speed_source: SpeedSource | None
-    distance_m: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,38 +546,31 @@ class NearHome:
     person_id: str
     name: str
     distance_m: float
-    still_since: float | None
 
 
 @dataclass(frozen=True, slots=True)
 class GroupView:
     """What a group's entities publish."""
 
-    candidates: tuple[Candidate, ...] = ()
+    heading_home: tuple[HeadingHome, ...] = ()
+    """Members heading home, the one expected first leading."""
     persons_home: tuple[str, ...] = ()
     arriving_soon: tuple[str, ...] = ()
     arriving_soon_names: tuple[str, ...] = ()
     missing: tuple[str, ...] = ()
     reporting: int = 0
     """Members with data; with none, the group knows nothing."""
-    heading_home: tuple[HomewardCandidate, ...] = ()
-    """Members heading home, the one expected first leading."""
     near: NearHome | None = None
     """None when no member's whereabouts are known."""
 
     @property
-    def first(self) -> Candidate | None:
-        """Return the member due first."""
-        return self.candidates[0] if self.candidates else None
-
-    @property
-    def expected_first(self) -> HomewardCandidate | None:
+    def first(self) -> HeadingHome | None:
         """Return the member heading home who is expected first."""
         return self.heading_home[0] if self.heading_home else None
 
 
 class GroupRuntime:
-    """Pick the first arrival among a group's members."""
+    """Combine the members of a group heading to one zone."""
 
     def __init__(self, hass: HomeAssistant, entry: HomeEtaConfigEntry) -> None:
         """Read the entry."""
@@ -711,14 +578,6 @@ class GroupRuntime:
         self.entry = entry
         self.zone_id: str = entry.data[CONF_ZONE]
         self.members: tuple[str, ...] = tuple(entry.options.get(CONF_MEMBERS) or ())
-        try:
-            self.near_config = near_home_config_from_options(entry.options)
-        except (TypeError, ValueError) as err:
-            raise ConfigEntryError(
-                translation_domain=DOMAIN,
-                translation_key="invalid_options",
-                translation_placeholders={"error": str(err)},
-            ) from err
         self._listeners: list[CALLBACK_TYPE] = []
         self._unsubscribe: Callable[[], None] | None = None
         self.view = GroupView()
@@ -730,7 +589,7 @@ class GroupRuntime:
             identifiers={(DOMAIN, self.entry.entry_id)},
             name=self.entry.title,
             entry_type=DeviceEntryType.SERVICE,
-            model="First arrival",
+            model="Group",
         )
 
     async def async_start(self) -> None:
@@ -773,13 +632,9 @@ class GroupRuntime:
 
     @callback
     def _refresh(self) -> None:
-        now = dt_util.utcnow()
-        moment = now.timestamp()
         persons = self.hass.data[DATA_KEY].persons
-        candidates: list[Candidate] = []
-        heading: list[HomewardCandidate] = []
+        heading: list[HeadingHome] = []
         home: list[str] = []
-        home_names: list[str] = []
         soon: list[str] = []
         soon_names: list[str] = []
         missing: list[str] = []
@@ -789,74 +644,37 @@ class GroupRuntime:
             if runtime is None or not runtime.view.available:
                 missing.append(person_id)
                 continue
-            snapshot = runtime.view.snapshot
+            view = runtime.view
+            snapshot = view.snapshot
             if snapshot is None:
                 missing.append(person_id)
                 continue
-            if snapshot.state is ApproachState.HOME:
+            name = runtime.entry.title
+            if snapshot.at_home:
                 home.append(person_id)
-                home_names.append(runtime.entry.title)
-                continue
-            homeward = snapshot.homeward
-            if (
-                homeward is not None
-                and homeward.heading
-                and homeward.arrival is not None
-            ):
-                arrival = dt_util.utc_from_timestamp(homeward.arrival)
-                heading.append(
-                    HomewardCandidate(
-                        person_id=person_id,
-                        name=runtime.entry.title,
-                        arrival=arrival,
-                        minutes=minutes_until(arrival, now),
-                        reason=homeward.reason,
-                        speed_source=homeward.speed_source,
-                        distance_m=snapshot.distance_m,
-                    )
-                )
-            distance = snapshot.distance_m
-            if homeward is not None and distance is not None:
-                value = near_home(
-                    distance, homeward.still_since, moment, self.near_config
-                )
-                if near is None or (value, -distance) > (near.value, -near.distance_m):
-                    near = NearHome(
-                        value,
-                        person_id,
-                        runtime.entry.title,
-                        distance,
-                        homeward.still_since,
-                    )
-            if snapshot.state is ApproachState.ARRIVING_SOON:
+            expected, minutes = view.expected_home, view.minutes_to_home
+            if expected is not None and minutes is not None:
+                heading.append(HeadingHome(person_id, name, expected, minutes))
+            if snapshot.arriving_soon:
                 soon.append(person_id)
-                soon_names.append(runtime.entry.title)
-            estimate = snapshot.kinematic
-            if snapshot.on_the_way and estimate is not None and not snapshot.stale:
-                arrival = dt_util.utc_from_timestamp(estimate.arrival)
-                candidates.append(
-                    Candidate(
-                        person_id=person_id,
-                        name=runtime.entry.title,
-                        arrival=arrival,
-                        minutes=minutes_until(arrival, now),
-                        confidence=estimate.confidence.value,
-                        state=snapshot.state,
-                    )
+                soon_names.append(name)
+            value, distance = snapshot.near_home, snapshot.distance_m
+            if (
+                value is not None
+                and distance is not None
+                and (
+                    near is None or (value, -distance) > (near.value, -near.distance_m)
                 )
-        candidates.sort(key=lambda c: (c.arrival, c.person_id))
-        heading.sort(key=lambda c: (c.arrival, c.person_id))
-        if home:
-            # Someone is home: as near as it gets.
-            near = NearHome(1.0, home[0], home_names[0], 0.0, None)
+            ):
+                near = NearHome(value, person_id, name, distance)
+        heading.sort(key=lambda member: (member.arrival, member.person_id))
         self.view = GroupView(
-            candidates=tuple(candidates),
+            heading_home=tuple(heading),
             persons_home=tuple(home),
             arriving_soon=tuple(soon),
             arriving_soon_names=tuple(soon_names),
             missing=tuple(missing),
             reporting=len(self.members) - len(missing),
-            heading_home=tuple(heading),
             near=near,
         )
         for update in list(self._listeners):
@@ -868,61 +686,26 @@ class GroupRuntime:
         return {
             "zone": self.zone_id,
             "members": list(self.members),
-            "candidates": [
+            "heading_home": [
                 {
-                    "person": c.person_id,
-                    "arrival": c.arrival.isoformat(),
-                    "minutes": c.minutes,
-                    "confidence": c.confidence,
-                    "state": c.state.value,
+                    "person": member.person_id,
+                    "arrival": member.arrival.isoformat(),
+                    "minutes": member.minutes,
                 }
-                for c in view.candidates
+                for member in view.heading_home
             ],
             "persons_home": list(view.persons_home),
             "arriving_soon": list(view.arriving_soon),
             "missing": list(view.missing),
-            "heading_home": [
-                {
-                    "person": c.person_id,
-                    "arrival": c.arrival.isoformat(),
-                    "minutes": c.minutes,
-                    "reason": c.reason.value,
-                    "speed_source": None
-                    if c.speed_source is None
-                    else c.speed_source.value,
-                }
-                for c in view.heading_home
-            ],
             "near_home": None
             if view.near is None
             else {
                 "value": round(view.near.value, 3),
                 "person": view.near.person_id,
                 "distance_m": round(view.near.distance_m),
-                "still_since": view.near.still_since,
-            },
-            "near_home_config": {
-                "radius_m": self.near_config.radius_m,
-                "full_m": self.near_config.full_m,
-                "fade_after_s": self.near_config.fade_after_s,
-                "fade_s": self.near_config.fade_s,
             },
         }
 
 
-def minutes_until(arrival: datetime, now: datetime) -> int:
-    """Return whole minutes until ``arrival``, never negative."""
-    return max(0, round((arrival - now).total_seconds() / 60.0))
-
-
-def store_key(entry_id: str) -> str:
-    """Return the storage key for an entry's learned history."""
-    return f"{DOMAIN}.history.{entry_id}"
-
-
 def _round(value: float | None, decimals: int) -> float | None:
     return None if value is None else round(value, decimals)
-
-
-def _fmt(value: float | None) -> str:
-    return "n/a" if value is None else f"{value:.2f}"

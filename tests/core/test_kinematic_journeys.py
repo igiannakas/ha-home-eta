@@ -1,8 +1,10 @@
-"""Kinematic ETA accuracy on synthetic journeys.
+"""Closing-speed accuracy on synthetic journeys.
 
-Each scenario runs over 30 seeded journeys (seeded, so deterministic) and
-checks the error of the ETA against ground truth while at least two minutes
-remain. Bounds are the behaviour we promise, with the reasoning beside each.
+The filtered closing speed feeds heading home: the progress rule and the
+measured half of the expected arrival. It is judged here by the arrival it
+implies on its own (remaining distance over the speed) against ground truth,
+while at least two minutes remain, over 30 seeded journeys per scenario.
+Bounds are the behaviour we promise, with the reasoning beside each.
 """
 
 from __future__ import annotations
@@ -18,18 +20,33 @@ from tests.sim import DENSE, IOS, TARGET, FixPolicy, Segment, SimFix, simulate
 
 SEEDS = range(30)
 MIN_REMAINING_S = 120.0
+PARAMS = EstimatorParams()
+
+
+def implied_remaining_s(estimator: KinematicEstimator, now: float) -> float | None:
+    """Return the time left at the filtered speed, None when it gives none."""
+    speed, distance = estimator.closing_speed_mps, estimator.distance_m
+    if (
+        speed is None
+        or distance is None
+        or estimator.stopped
+        or estimator.is_stale(now)
+        or speed < PARAMS.min_closing_speed_mps
+    ):
+        return None
+    return min(max(distance - TARGET.radius_m, 0.0) / speed, PARAMS.max_eta_s)
 
 
 @dataclass(frozen=True)
 class Check:
-    """The ETA error at one accepted fix."""
+    """The implied arrival's error at one accepted fix."""
 
     leg: int
     nth_in_leg: int
     """1-based count of accepted fixes within the leg."""
     nth_overall: int
     error: float | None
-    """Relative error, None when the ETA was undefined."""
+    """Relative error, None when the speed gave no arrival."""
 
 
 def run(
@@ -37,7 +54,7 @@ def run(
 ) -> list[Check]:
     """Feed one journey through a fresh estimator."""
     fixes: list[SimFix] = simulate(start, segments, policy=policy, seed=seed)
-    estimator = KinematicEstimator(EstimatorParams(), TARGET)
+    estimator = KinematicEstimator(PARAMS, TARGET)
     checks: list[Check] = []
     overall = 0
     per_leg: dict[int, int] = {}
@@ -49,18 +66,17 @@ def run(
         per_leg[sim_fix.leg] = per_leg.get(sim_fix.leg, 0) + 1
         if sim_fix.true_remaining_s < MIN_REMAINING_S:
             continue
-        estimate = estimator.estimate(sim_fix.fix.timestamp)
+        predicted = implied_remaining_s(estimator, sim_fix.fix.timestamp)
         error = None
-        if estimate is not None:
-            predicted = estimate.arrival - sim_fix.fix.timestamp
+        if predicted is not None:
             error = (predicted - sim_fix.true_remaining_s) / sim_fix.true_remaining_s
         checks.append(Check(sim_fix.leg, per_leg[sim_fix.leg], overall, error))
     return checks
 
 
 def errors(checks: list[Check]) -> list[float]:
-    """Return absolute errors, failing if any ETA was undefined."""
-    assert all(c.error is not None for c in checks), "ETA undefined while moving"
+    """Return absolute errors, failing if the speed gave no arrival anywhere."""
+    assert all(c.error is not None for c in checks), "no speed while moving"
     return [abs(c.error) for c in checks if c.error is not None]
 
 
@@ -88,7 +104,7 @@ def train_then_walk(dwell_s: float) -> tuple[tuple[float, float], list[Segment]]
 
 @pytest.mark.parametrize("policy", [IOS, DENSE], ids=["ios", "dense"])
 def test_straight_car_within_4_percent(policy: FixPolicy) -> None:
-    """A steady radial drive is the estimator's home ground (README: 4 %)."""
+    """A steady radial drive is the estimator's home ground."""
     for seed in SEEDS:
         checks = [c for c in run(*STRAIGHT_CAR, policy, seed) if c.nth_overall >= 3]
         assert checks
@@ -118,10 +134,7 @@ def test_straight_walk_dense_noise_limited() -> None:
 
 @pytest.mark.parametrize("policy", [IOS, DENSE], ids=["ios", "dense"])
 def test_winding_route_within_25_percent(policy: FixPolicy) -> None:
-    """A 1.2 detour factor mostly cancels; corners near the end cost accuracy.
-
-    README: typically 6 %, at worst 25 %.
-    """
+    """A 1.2 detour factor mostly cancels; corners near the end cost accuracy."""
     all_errors: list[float] = []
     for seed in SEEDS:
         checks = [c for c in run(*WINDING_CAR, policy, seed) if c.nth_overall >= 3]
@@ -133,10 +146,10 @@ def test_winding_route_within_25_percent(policy: FixPolicy) -> None:
 
 @pytest.mark.parametrize("dwell_s", [120.0, 720.0], ids=["short_wait", "long_wait"])
 def test_train_then_walk_ios_adapts_by_second_walking_fix(dwell_s: float) -> None:
-    """On the train the ETA cannot know about the walk (documented limit).
+    """On the train the speed cannot know about the walk ahead.
 
     The first walking fix straddles the change of mode; from the second the
-    ETA follows the walk.
+    speed follows the walk.
     """
     second: list[float] = []
     for seed in SEEDS:
@@ -144,7 +157,7 @@ def test_train_then_walk_ios_adapts_by_second_walking_fix(dwell_s: float) -> Non
         later = [c for c in walk if c.nth_in_leg >= 3]
         assert max(errors(later), default=0.0) <= 0.25, seed
         second.extend(errors([c for c in walk if c.nth_in_leg == 2]))
-    # README: typically within 5 % from the second report on foot.
+    # Typically within 5 % from the second report on foot.
     assert statistics.median(second) <= 0.05
 
 
@@ -161,7 +174,10 @@ def test_train_then_walk_dense_adapts_within_five_fixes(dwell_s: float) -> None:
 
 
 def test_train_leg_is_optimistic_by_design() -> None:
-    """Pin the documented limit: on the train the ETA ignores the walk ahead."""
+    """Pin the limit: on the train the speed alone ignores the walk ahead.
+
+    That is why heading home blends it with the typical speed for the distance.
+    """
     checks = run(*train_then_walk(120.0), IOS, 0)
     train = [c for c in checks if c.leg == 0 and c.nth_overall >= 3]
     assert train

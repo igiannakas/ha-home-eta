@@ -7,13 +7,18 @@ from typing import Any
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import (
+    ExtraStoredData,
+    RestoredExtraData,
+    RestoreEntity,
+)
 from homeassistant.util import dt as dt_util
 
 from . import HomeEtaConfigEntry
 from .const import KEY_ARRIVING_SOON, KEY_HEADING_HOME, KEY_SOMEONE_SOON
-from .core.approach import ApproachState
+from .core.homeward import HomewardRestore
 from .entity import GroupEntity, PersonEntity
-from .runtime import GroupRuntime, PersonRuntime, minutes_until
+from .runtime import GroupRuntime, PersonRuntime
 
 PARALLEL_UPDATES = 0
 
@@ -28,74 +33,58 @@ async def async_setup_entry(
     if isinstance(runtime, GroupRuntime):
         async_add_entities([SomeoneArrivingSoonSensor(runtime)])
     else:
-        async_add_entities([ArrivingSoonSensor(runtime), HeadingHomeSensor(runtime)])
+        async_add_entities([HeadingHomeSensor(runtime), ArrivingSoonSensor(runtime)])
 
 
-class ArrivingSoonSensor(PersonEntity, BinarySensorEntity):
-    """On while the person is arriving soon.
-
-    Held off while the person is inside any zone other than the target.
-    """
-
-    def __init__(self, runtime: PersonRuntime) -> None:
-        """Initialise."""
-        super().__init__(runtime, KEY_ARRIVING_SOON)
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return True when arriving soon."""
-        snap = self._runtime.view.snapshot
-        return None if snap is None else snap.state is ApproachState.ARRIVING_SOON
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return the threshold in use."""
-        return {"threshold_min": self._runtime.view.threshold_min}
-
-
-class HeadingHomeSensor(PersonEntity, BinarySensorEntity):
+class HeadingHomeSensor(PersonEntity, BinarySensorEntity, RestoreEntity):
     """On while the person is on their way home, from early in the trip.
 
-    For warming the house: it comes on well before "arriving soon" (at the
-    first clear progress towards home, or on entering a zone around home) and
-    stays on until the person gets home or the trip clearly is not one.
+    It comes on at the first clear progress towards home, or on entering a
+    zone around home, and stays on until the person gets home or the trip
+    clearly is not one. The trip home (and a stay somewhere) is saved for a
+    restart.
     """
 
-    _unrecorded_attributes = frozenset(
-        {"expected_at", "minutes", "speed_mps", "farthest_m"}
-    )
+    _unrecorded_attributes = frozenset({"speed_mps", "farthest_m"})
 
     def __init__(self, runtime: PersonRuntime) -> None:
         """Initialise."""
         super().__init__(runtime, KEY_HEADING_HOME)
 
+    async def async_added_to_hass(self) -> None:
+        """Restore the trip home and stay saved before a restart or reload."""
+        await super().async_added_to_hass()
+        extra = await self.async_get_last_extra_data()
+        if extra is None:
+            return
+        data = HomewardRestore.from_dict(extra.as_dict())
+        if data is not None:
+            self._runtime.restore_homeward(data)
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData | None:
+        """Save the trip home and stay, if any."""
+        data = self._runtime.tracker.homeward.restore_data()
+        return None if data is None else RestoredExtraData(data.as_dict())
+
     @property
     def is_on(self) -> bool | None:
         """Return True while heading home, None with no data."""
         snap = self._runtime.view.snapshot
-        if snap is None:
-            return None
-        return snap.homeward is not None and snap.homeward.heading
+        return None if snap is None else snap.heading_home
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return why, since when, and when the person is expected."""
+        """Return why and since when, and the speed behind the expected arrival."""
         snap = self._runtime.view.snapshot
-        homeward = None if snap is None else snap.homeward
-        if homeward is None:
+        if snap is None:
             return {}
-        arrival = (
-            None
-            if homeward.arrival is None
-            else dt_util.utc_from_timestamp(homeward.arrival)
-        )
+        homeward = snap.homeward
         return {
             "reason": homeward.reason.value,
-            "since": _iso(homeward.since),
-            "expected_at": None if arrival is None else arrival.isoformat(),
-            "minutes": None
-            if arrival is None
-            else minutes_until(arrival, dt_util.utcnow()),
+            "since": None
+            if homeward.since is None
+            else dt_util.utc_from_timestamp(homeward.since).isoformat(),
             "speed_mps": None
             if homeward.speed_mps is None
             else round(homeward.speed_mps, 1),
@@ -105,12 +94,30 @@ class HeadingHomeSensor(PersonEntity, BinarySensorEntity):
             "farthest_m": None
             if homeward.farthest_m is None
             else round(homeward.farthest_m),
-            "staying_since": _iso(homeward.still_since),
         }
 
 
-def _iso(value: float | None) -> str | None:
-    return None if value is None else dt_util.utc_from_timestamp(value).isoformat()
+class ArrivingSoonSensor(PersonEntity, BinarySensorEntity):
+    """On once the person heading home is due within the threshold, or close by.
+
+    Held off while inside any zone other than the target and the zones around
+    it; once on, it stays on until the trip home ends.
+    """
+
+    def __init__(self, runtime: PersonRuntime) -> None:
+        """Initialise."""
+        super().__init__(runtime, KEY_ARRIVING_SOON)
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True while arriving soon, None with no data."""
+        snap = self._runtime.view.snapshot
+        return None if snap is None else snap.arriving_soon
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the threshold in use."""
+        return {"threshold_min": self._runtime.view.threshold_min}
 
 
 class SomeoneArrivingSoonSensor(GroupEntity, BinarySensorEntity):

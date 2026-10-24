@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-r"""Replay recorder history through the Home ETA estimators and score them.
+r"""Replay recorder history through Home ETA and score what it would have said.
 
 Every trip that ends inside the target zone is replayed fix by fix through the
-integration's own estimator code, and the ETA at each fix is compared with the
-time actually taken. Learned history is built up online, trip by trip, so the
-historical ETA is scored only on trips it had not seen.
+integration's own code, with its minute tick. Three things are scored:
+
+- Heading home: how long before each arrival it came on for good, and how
+  often it came on for a trip that was not one.
+- Expected home: at each fix while heading home, the arrival it expected
+  against the time actually taken.
+- Arriving soon: how long before arrival it came on, how often far too early
+  (over twice the threshold), and arrivals it missed.
 
 Pull straight from Home Assistant (the token is read from HA_TOKEN):
 
@@ -17,10 +22,8 @@ websocket ``history/history_during_period`` result, made without
 
     python3 scripts/backtest.py --input history.json --zone LATITUDE,LONGITUDE,RADIUS_M
 
-Besides the ETAs it scores "heading home" (the signal for warming the house):
-how long before each arrival it came on for good, and how often it came on
-for a trip that was not one. Zones around home (``--enclosing-zone``, given
-with their shape) are replayed as the rings they are.
+Zones around home (``--enclosing-zone``, given with their shape) are replayed
+as the rings they are; with ``--url`` they are found automatically.
 
 Exit status: 0 when every acceptance check passes, 1 when one fails, 2 when
 there is not enough data for a verdict or the input cannot be used.
@@ -29,8 +32,8 @@ Only the Python standard library (3.11 or later) is needed; no Home Assistant.
 
 Known difference from the live integration: after a Home Assistant restart the
 recorder stores the person's last position again, stamped with the restart
-time. The integration ignores those for speed until Home Assistant has started;
-a recorder export does not mark them, so they are replayed as ordinary fixes.
+time. The integration does not use those as fixes until Home Assistant has
+started; a recorder export does not mark them, so they are replayed as fixes.
 """
 
 from __future__ import annotations
@@ -72,13 +75,16 @@ ACCEPT_MIN_TRIPS = 5
 """Completed trips needed (over everyone) before a verdict is given."""
 ACCEPT_MIN_FIXES = 20
 """Scored fixes within the acceptance distance needed before a verdict."""
+MIN_TRIP_FIXES = 4
+MIN_TRIP_DURATION_S = 300.0
+"""Shorter trips (or with fewer fixes) are not scored: too little to judge."""
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_NO_VERDICT = 2
 
 KEEP_ATTRIBUTES = ("in_zones", "latitude", "longitude", "gps_accuracy")
-"""All the estimators read; a saved export keeps nothing else."""
+"""All Home ETA reads; a saved export keeps nothing else."""
 
 
 class BacktestError(Exception):
@@ -104,7 +110,7 @@ def load_core() -> dict[str, ModuleType]:
     spec.loader.exec_module(package)
     return {
         name: importlib.import_module(f"{CORE_PACKAGE}.{name}")
-        for name in ("approach", "geo", "homeward", "kinematic", "params", "tracker")
+        for name in ("geo", "homeward", "kinematic", "params", "tracker")
     }
 
 
@@ -398,7 +404,7 @@ def _key_value(value: str) -> tuple[str, str]:
 def _params(
     core: dict[str, ModuleType], pairs: list[tuple[str, str]], parser: Any
 ) -> Any:
-    """Build the estimator parameters from ``--param`` overrides."""
+    """Build the tracking parameters from ``--param`` overrides."""
     params_cls = core["params"].EstimatorParams
     types = {f.name: f.type for f in fields(params_cls)}
     overrides: dict[str, Any] = {}
@@ -421,12 +427,12 @@ def _params(
 
 @dataclass(slots=True)
 class Sample:
-    """The estimates at one accepted fix of a completed trip."""
+    """What was expected at one accepted fix of a completed trip."""
 
     distance_m: float
     true_s: float
-    kinematic_s: float | None
-    historical_s: float | None
+    expected_s: float | None
+    """Time to the expected arrival; None when not heading home."""
 
 
 @dataclass(slots=True)
@@ -474,12 +480,10 @@ def replay(
     *,
     params: Any,
     threshold_s: float,
-    ignored: frozenset[str],
     enclosing: frozenset[str] = frozenset(),
     rings: Iterable[Zone] = (),
 ) -> PersonResult:
     """Replay one person's history and score every completed trip."""
-    approach = core["approach"]
     arrived_reason = core["homeward"].HomewardReason.ARRIVED
     tracker_mod = core["tracker"]
     target_cls = core["kinematic"].Target
@@ -490,19 +494,21 @@ def replay(
         return result
 
     first = report_from_row(core, rows[0], zone, enclosing)
-    config = tracker_mod.TrackerConfig(params, ignored, historical=True)
+    config = tracker_mod.TrackerConfig(params)
     trk = tracker_mod.PersonTracker(config, target, at_target=first.in_target)
     trk.set_threshold(threshold_s)
     trk.set_rings(target_cls(z.latitude, z.longitude, z.radius_m) for z in rings)
 
-    trip: list[tuple[float, float, float | None, float | None]] = []
+    trip: list[tuple[float, float, float | None]] = []
     soon_entries: list[float] = []
     trip_live = False  # only score trips that began inside this export
     last_time = first.timestamp
     heading_since: float | None = None
+    soon = False
 
-    def track_heading(at: float) -> None:
-        nonlocal heading_since
+    def follow(at: float) -> None:
+        """Note heading home and arriving soon coming on and going off."""
+        nonlocal heading_since, soon
         homeward = trk.homeward
         if homeward.heading and heading_since is None:
             heading_since = at
@@ -511,17 +517,9 @@ def replay(
                 result.heading_false += 1
                 result.heading_false_s += at - heading_since
             heading_since = None
-
-    def on_transition(transition: Any, at: float) -> None:
-        nonlocal trip_live
-        if transition is None:
-            return
-        if transition.current is approach.ApproachState.ARRIVING_SOON:
+        if homeward.arriving_soon and not soon and trip_live:
             soon_entries.append(at)
-        if transition.previous is approach.ApproachState.HOME:
-            trip.clear()
-            soon_entries.clear()
-            trip_live = True
+        soon = homeward.arriving_soon
 
     for row in rows:
         report = report_from_row(core, row, zone, enclosing)
@@ -529,58 +527,49 @@ def replay(
             result.positions += 1
         # Housekeeping ticks between reports, as the integration runs them.
         tick_at = last_time + TICK_S
-        while (
-            tick_at < report.timestamp and trk.state is not approach.ApproachState.HOME
-        ):
-            on_transition(trk.tick(tick_at), tick_at)
-            track_heading(tick_at)
+        while tick_at < report.timestamp and not trk.at_home:
+            trk.tick(tick_at)
+            follow(tick_at)
             tick_at += TICK_S
         last_time = report.timestamp
 
-        before = trk.state
+        was_home = trk.at_home
         heading_before = heading_since
-        update = trk.update(report)
-        on_transition(update.transition, report.timestamp)
-        track_heading(report.timestamp)
+        soon_before = soon
+        outcome = trk.update(report)
+        if was_home and not trk.at_home:
+            trip.clear()
+            soon_entries.clear()
+            trip_live = True
+        follow(report.timestamp)
 
-        if update.outcome is not None and update.outcome.accepted and trip_live:
-            snap = trk.snapshot(report.timestamp)
-            kinematic = (
-                None
-                if snap.kinematic is None
-                else snap.kinematic.arrival - report.timestamp
-            )
-            historical = (
-                None
-                if snap.historical is None
-                else snap.historical.arrival - report.timestamp
-            )
-            if update.outcome.distance_m is not None:
-                trip.append(
-                    (report.timestamp, update.outcome.distance_m, kinematic, historical)
+        if (
+            outcome is not None
+            and outcome.accepted
+            and outcome.distance_m is not None
+            and trip_live
+        ):
+            expected = trk.snapshot(report.timestamp).expected_home
+            trip.append(
+                (
+                    report.timestamp,
+                    outcome.distance_m,
+                    None if expected is None else expected - report.timestamp,
                 )
+            )
 
-        arrived = (
-            update.transition is not None
-            and update.transition.current is approach.ApproachState.HOME
-        )
-        if arrived and trip_live:
+        if trip_live and not was_home and trk.at_home:
             arrival = report.timestamp
             duration = arrival - trip[0][0] if trip else 0.0
-            if (
-                len(trip) >= params.min_trip_fixes
-                and duration >= params.min_trip_duration_s
-            ):
+            if len(trip) >= MIN_TRIP_FIXES and duration >= MIN_TRIP_DURATION_S:
                 result.trips += 1
-                result.samples.extend(
-                    Sample(d, arrival - t, k, h) for t, d, k, h in trip
-                )
+                result.samples.extend(Sample(d, arrival - t, e) for t, d, e in trip)
                 for entry in soon_entries:
                     lead = arrival - entry
                     result.soon_lead_s.append(lead)
                     if lead > 2 * threshold_s:
                         result.false_soon += 1
-                if before is not approach.ApproachState.ARRIVING_SOON:
+                if not soon_before:
                     result.missed_soon += 1
                 result.heading_warning_s.append(
                     0.0 if heading_before is None else arrival - heading_before
@@ -602,14 +591,14 @@ def _quantile(values: list[float], q: float) -> float:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
-def _errors_min(samples: Iterable[Sample], attr: str) -> tuple[list[float], int]:
+def _errors_min(samples: Iterable[Sample]) -> tuple[list[float], int]:
+    """Return the expected-home errors in minutes, and how many fixes there were."""
     errors: list[float] = []
     total = 0
     for sample in samples:
         total += 1
-        predicted = getattr(sample, attr)
-        if predicted is not None:
-            errors.append(abs(predicted - sample.true_s) / 60.0)
+        if sample.expected_s is not None:
+            errors.append(abs(sample.expected_s - sample.true_s) / 60.0)
     return errors, total
 
 
@@ -627,25 +616,21 @@ def summarise(result: PersonResult) -> Iterator[str]:
         yield "  No completed trips with enough fixes in this window."
         return
     yield (
-        f"  {'distance':<12}{'fixes':>6}  {'kinematic: cover  med  p90 (min)':>34}"
-        f"  {'historical: cover  med  p90 (min)':>35}"
+        f"  {'distance':<12}{'fixes':>6}  {'heading home':>12}"
+        f"  {'expected home error: med  p90 (min)':>36}"
     )
     for low, high in DISTANCE_BANDS_M:
         band = [s for s in result.samples if low <= s.distance_m < high]
         if not band:
             continue
-        cells = []
-        for attr in ("kinematic_s", "historical_s"):
-            errors, total = _errors_min(band, attr)
-            if errors:
-                cells.append(
-                    f"{len(errors) / total:>11.0%} {statistics.median(errors):>5.1f}"
-                    f" {_quantile(errors, 0.9):>5.1f}"
-                )
-            else:
-                cells.append(f"{'0%':>11} {'-':>5} {'-':>5}")
+        errors, total = _errors_min(band)
+        cell = (
+            f"{statistics.median(errors):>5.1f} {_quantile(errors, 0.9):>5.1f}"
+            if errors
+            else f"{'-':>5} {'-':>5}"
+        )
         label = _band_label(low, high)
-        yield f"  {label:<12}{len(band):>6}  {cells[0]:>34}  {cells[1]:>35}"
+        yield (f"  {label:<12}{total:>6}  {len(errors) / total:>12.0%}  {cell:>36}")
     per_10 = 10 * result.false_soon / result.trips if result.trips else 0.0
     yield (
         f"  arriving soon ({result.threshold_s / 60:g} min): {result.false_soon} "
@@ -676,21 +661,21 @@ def summarise(result: PersonResult) -> Iterator[str]:
 def acceptance(results: list[PersonResult]) -> tuple[list[str], int]:
     """Return the go-live acceptance report and the exit status it implies."""
     near = [s for r in results for s in r.samples if s.distance_m < ACCEPT_P90_BELOW_M]
-    errors, _ = _errors_min(near, "kinematic_s")
+    errors, _ = _errors_min(near)
     trips = sum(r.trips for r in results)
     false_soon = sum(r.false_soon for r in results)
     lines = ["", "Acceptance"]
     if trips < ACCEPT_MIN_TRIPS or len(errors) < ACCEPT_MIN_FIXES:
         lines.append(
             f"  Not enough data for a verdict: {trips} completed trips (need "
-            f"{ACCEPT_MIN_TRIPS}) and {len(errors)} scored fixes under "
+            f"{ACCEPT_MIN_TRIPS}) and {len(errors)} fixes heading home under "
             f"{ACCEPT_P90_BELOW_M / 1000:g} km (need {ACCEPT_MIN_FIXES})."
         )
         return lines, EXIT_NO_VERDICT
     p90 = _quantile(errors, 0.9)
     p90_ok = p90 <= ACCEPT_P90_MIN
     lines.append(
-        f"  kinematic p90 error under {ACCEPT_P90_BELOW_M / 1000:g} km: "
+        f"  expected home p90 error under {ACCEPT_P90_BELOW_M / 1000:g} km: "
         f"{p90:.1f} min (target <= {ACCEPT_P90_MIN:g}) "
         f"{'pass' if p90_ok else 'FAIL'}"
     )
@@ -768,13 +753,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="estimator parameter as set in Advanced, e.g. stale_after_s=1200",
-    )
-    parser.add_argument(
-        "--ignore-zone",
-        action="append",
-        default=[],
-        help="zone entity id that ends a leg, e.g. zone.work (repeat)",
+        help="tracking parameter as set in Advanced, e.g. stale_after_s=1200",
     )
     parser.add_argument("--json", type=Path, help="write per-fix results here")
     return parser
@@ -867,7 +846,6 @@ def main(argv: list[str] | None = None) -> int:
             zone,
             params=params,
             threshold_s=thresholds.get(person, args.threshold_min * 60.0),
-            ignored=frozenset(args.ignore_zone),
             enclosing=enclosing,
             rings=rings,
         )
@@ -906,8 +884,9 @@ def main(argv: list[str] | None = None) -> int:
                             {
                                 "distance_m": round(s.distance_m, 1),
                                 "true_s": round(s.true_s, 1),
-                                "kinematic_s": s.kinematic_s,
-                                "historical_s": s.historical_s,
+                                "expected_s": None
+                                if s.expected_s is None
+                                else round(s.expected_s, 1),
                             }
                             for s in r.samples
                         ],

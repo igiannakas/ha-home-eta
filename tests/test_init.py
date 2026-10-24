@@ -1,4 +1,4 @@
-"""Tests for setup, unload, removal, history storage, services and diagnostics."""
+"""Tests for setup, unload, removal, migration, renames and diagnostics."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er, issue_registry as ir
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -20,28 +19,25 @@ from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
 from custom_components.home_eta.const import (
     CONF_ADVANCED,
-    CONF_ENABLE_HISTORICAL,
-    CONF_IGNORED_ZONES,
+    CONF_ENTRY_TYPE,
     CONF_MEMBERS,
+    CONF_NEAR_HOME_FADE_AFTER_MIN,
+    CONF_NEAR_HOME_RADIUS_M,
+    CONF_PERSON,
+    CONF_ZONE,
     DOMAIN,
-    SERVICE_EXPORT_HISTORY,
-    SERVICE_RESET_HISTORY,
+    ENTRY_TYPE_GROUP,
+    ENTRY_TYPE_PERSON,
 )
-from custom_components.home_eta.core.params import MIN_HIST_TRIPS
-from custom_components.home_eta.runtime import DATA_KEY, PersonRuntime, store_key
-from tests.helpers import (
-    ALEX,
-    SAM,
-    drive_home,
-    group_entry,
-    person_entry,
-    set_person,
-    step,
+from custom_components.home_eta.migration import (
+    CONFIG_MINOR_VERSION,
+    LEGACY_GROUP_ENTITIES,
+    LEGACY_PERSON_ENTITIES,
 )
+from custom_components.home_eta.runtime import DATA_KEY, PersonRuntime
+from tests.helpers import ALEX, SAM, group_entry, person_entry, set_person, step
 
 pytestmark = pytest.mark.usefixtures("zones")
-
-HISTORY = {CONF_ENABLE_HISTORICAL: True}
 
 
 async def setup(hass: HomeAssistant, **kwargs: Any) -> Any:
@@ -50,16 +46,6 @@ async def setup(hass: HomeAssistant, **kwargs: Any) -> Any:
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return entry
-
-
-async def trip(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
-    """Leave home, wait, then walk 3 km home with a fix every 5 minutes."""
-    await step(hass, freezer, ALEX, 3_000, seconds=600)
-    await step(hass, freezer, ALEX, 3_000, seconds=3_600, zones=("zone.work",))
-    await drive_home(
-        hass, freezer, ALEX, start_m=3_000, speed_mps=1.4, interval_s=300, stop_m=150
-    )
-    await step(hass, freezer, ALEX, 10, zones=("zone.home",))
 
 
 async def test_unload_and_reload(
@@ -85,9 +71,8 @@ async def test_unload_and_reload(
     await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
-    set_person(hass, ALEX, 4_000)
-    await hass.async_block_till_done()
-    assert hass.states.get("sensor.alex_distance_to_home").state == "4000"
+    await step(hass, freezer, ALEX, 3_500)
+    assert hass.states.get("sensor.alex_distance_to_home").state == "3500"
 
 
 async def test_failed_start_leaves_nothing_behind(
@@ -124,83 +109,18 @@ async def test_zone_not_ready(hass: HomeAssistant) -> None:
     }
 
 
-async def test_invalid_advanced_options(hass: HomeAssistant) -> None:
+@pytest.mark.parametrize(
+    "options",
+    [
+        {CONF_ADVANCED: {"max_gps_accuracy_m": -5}},
+        {CONF_NEAR_HOME_RADIUS_M: 500},
+        {CONF_NEAR_HOME_FADE_AFTER_MIN: -10},
+    ],
+)
+async def test_invalid_options(hass: HomeAssistant, options: dict[str, Any]) -> None:
     set_person(hass, ALEX, 5_000)
-    entry = await setup(hass, options={CONF_ADVANCED: {"max_gps_accuracy_m": -5}})
+    entry = await setup(hass, options=options)
     assert entry.state is ConfigEntryState.SETUP_ERROR
-
-
-async def test_history_learned_saved_and_removed(
-    hass: HomeAssistant,
-    freezer: FrozenDateTimeFactory,
-    hass_storage: dict[str, Any],
-) -> None:
-    set_person(hass, ALEX, None, zones=("zone.home",))
-    entry = await setup(hass, options={**HISTORY, CONF_IGNORED_ZONES: ["zone.work"]})
-    for _ in range(MIN_HIST_TRIPS):
-        await trip(hass, freezer)
-    key = store_key(entry.entry_id)
-    assert hass_storage[key]["data"]["trips_learned"] == MIN_HIST_TRIPS
-    historical = hass.states.get("sensor.alex_eta_historical")
-    assert historical.attributes["trips_learned"] == MIN_HIST_TRIPS
-
-    # The next trip has a historical ETA once it is on the way.
-    await step(hass, freezer, ALEX, 3_000, seconds=600)
-    await step(hass, freezer, ALEX, 2_600, seconds=300)
-    await step(hass, freezer, ALEX, 2_200, seconds=300)
-    assert hass.states.get("sensor.alex_approach").state == "approaching"
-    historical = hass.states.get("sensor.alex_eta_historical")
-    assert historical.state != "unknown"
-    assert historical.attributes["trips"] == MIN_HIST_TRIPS
-
-    # Restart: the history is loaded back from storage.
-    await hass.config_entries.async_reload(entry.entry_id)
-    await hass.async_block_till_done()
-    assert entry.runtime_data.tracker.historical.trips_learned == MIN_HIST_TRIPS
-
-    await hass.config_entries.async_remove(entry.entry_id)
-    await hass.async_block_till_done()
-    assert key not in hass_storage
-
-
-async def test_services(
-    hass: HomeAssistant, freezer: FrozenDateTimeFactory, hass_storage: dict[str, Any]
-) -> None:
-    set_person(hass, ALEX, None, zones=("zone.home",))
-    set_person(hass, SAM, 5_000)
-    alex = await setup(hass, options=HISTORY)
-    await setup(hass, person=SAM)
-    await trip(hass, freezer)
-
-    response = await hass.services.async_call(
-        DOMAIN, SERVICE_EXPORT_HISTORY, {}, blocking=True, return_response=True
-    )
-    people = {p["person"]: p for p in response["people"]}
-    assert people[ALEX]["enabled"] is True
-    assert people[ALEX]["trips_learned"] == 1
-    assert people[SAM]["enabled"] is False
-
-    response = await hass.services.async_call(
-        DOMAIN,
-        SERVICE_EXPORT_HISTORY,
-        {"person": [SAM]},
-        blocking=True,
-        return_response=True,
-    )
-    assert [p["person"] for p in response["people"]] == [SAM]
-
-    with pytest.raises(ServiceValidationError):
-        await hass.services.async_call(
-            DOMAIN, SERVICE_RESET_HISTORY, {"person": [SAM]}, blocking=True
-        )
-    with pytest.raises(ServiceValidationError):
-        await hass.services.async_call(
-            DOMAIN, SERVICE_RESET_HISTORY, {"person": ["person.nobody"]}, blocking=True
-        )
-
-    await hass.services.async_call(DOMAIN, SERVICE_RESET_HISTORY, {}, blocking=True)
-    assert alex.runtime_data.tracker.historical.trips_learned == 0
-    assert hass_storage[store_key(alex.entry_id)]["data"]["trips_learned"] == 0
 
 
 async def test_diagnostics(
@@ -220,69 +140,29 @@ async def test_diagnostics(
     data = await get_diagnostics_for_config_entry(hass, hass_client, entry)
     runtime = data["runtime"]
     assert runtime["person"] == ALEX
+    assert runtime["near_home"]["radius_m"] == 3_000
     # The state present at setup is not logged; the two changes are.
     assert len(runtime["recent_fixes"]) == 2
     fix = runtime["recent_fixes"][-1]
     assert fix["verdict"] == "moved"
     assert fix["latitude"] == round(fix["latitude"], 2)
     assert fix["longitude"] == round(fix["longitude"], 2)
-    assert runtime["tracker"]["approach"]["state"] in ("approaching", "arriving_soon")
+    assert runtime["tracker"]["homeward"]["heading"] is True
 
     data = await get_diagnostics_for_config_entry(hass, hass_client, group)
     assert data["runtime"]["members"] == [ALEX]
+    assert [m["person"] for m in data["runtime"]["heading_home"]] == [ALEX]
+    assert data["runtime"]["near_home"]["person"] == ALEX
 
 
-async def test_turning_learning_off_deletes_history(
-    hass: HomeAssistant, freezer: FrozenDateTimeFactory, hass_storage: dict[str, Any]
-) -> None:
-    """Regression: learned trips outlived the option and could not be reset."""
-    set_person(hass, ALEX, None, zones=("zone.home",))
-    entry = await setup(hass, options=HISTORY)
-    await trip(hass, freezer)
-    key = store_key(entry.entry_id)
-    assert hass_storage[key]["data"]["trips_learned"] == 1
-    hass.config_entries.async_update_entry(
-        entry, options={**entry.options, CONF_ENABLE_HISTORICAL: False}
-    )
-    await hass.config_entries.async_reload(entry.entry_id)
-    await hass.async_block_till_done()
-    assert key not in hass_storage
-
-
-async def test_services_accept_entity_registry_ids(
-    hass: HomeAssistant, freezer: FrozenDateTimeFactory
-) -> None:
-    """Regression: the schema allowed registry ids but nothing resolved them."""
-    registry = er.async_get(hass)
-    person = registry.async_get_or_create(
-        "person", "person", "alex-id", suggested_object_id="alex"
-    )
-    assert person.entity_id == ALEX
-    set_person(hass, ALEX, None, zones=("zone.home",))
-    await setup(hass, options=HISTORY)
-    response = await hass.services.async_call(
-        DOMAIN,
-        SERVICE_EXPORT_HISTORY,
-        {"person": [person.id]},
-        blocking=True,
-        return_response=True,
-    )
-    assert [p["person"] for p in response["people"]] == [ALEX]
-
-
-async def test_renamed_person_and_zone_are_followed(
-    hass: HomeAssistant, freezer: FrozenDateTimeFactory
-) -> None:
+async def test_renamed_person_and_zone_are_followed(hass: HomeAssistant) -> None:
     """Regression: renaming the person broke tracking and orphaned the entry."""
     registry = er.async_get(hass)
     registry.async_get_or_create(
         "person", "person", "alex-id", suggested_object_id="alex"
     )
-    office = registry.async_get_or_create(
-        "zone", "zone", "office-id", suggested_object_id="office"
-    )
     set_person(hass, ALEX, 5_000)
-    entry = await setup(hass, options={CONF_IGNORED_ZONES: [office.entity_id]})
+    entry = await setup(hass)
     # A group created as "Home ETA" and retitled since.
     template = group_entry([ALEX])
     group = MockConfigEntry(
@@ -291,6 +171,7 @@ async def test_renamed_person_and_zone_are_followed(
         data=dict(template.data),
         options=dict(template.options),
         unique_id="group|zone.home|home_eta",
+        minor_version=CONFIG_MINOR_VERSION,
     )
     group.add_to_hass(hass)
     await hass.config_entries.async_setup(group.entry_id)
@@ -312,10 +193,29 @@ async def test_renamed_person_and_zone_are_followed(
         DOMAIN, f"person_missing_{entry.entry_id}"
     )
 
+
+async def test_renamed_zone_is_followed(hass: HomeAssistant) -> None:
+    registry = er.async_get(hass)
+    office = registry.async_get_or_create(
+        "zone", "zone", "office-id", suggested_object_id="office"
+    )
+    shape = dict(hass.states.get("zone.work").attributes)
+    hass.states.async_set(office.entity_id, "0", shape)
+    set_person(hass, SAM, 5_000)
+    entry = await setup(hass, person=SAM, zone=office.entity_id, title="Sam to Office")
+    assert entry.state is ConfigEntryState.LOADED
     registry.async_update_entity(office.entity_id, new_entity_id="zone.workplace")
     await hass.async_block_till_done()
-    assert entry.options[CONF_IGNORED_ZONES] == ["zone.workplace"]
+    assert entry.data[CONF_ZONE] == "zone.workplace"
+    assert entry.unique_id == f"{SAM}|zone.workplace"
+    # The zone's state moves to its new id a moment after the rename; until
+    # then the entry waits for it, as for any zone not there yet.
+    hass.states.async_remove(office.entity_id)
+    hass.states.async_set("zone.workplace", "0", shape)
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data.zone_id == "zone.workplace"
 
 
 async def test_removing_a_person_takes_them_out_of_groups(
@@ -338,7 +238,7 @@ async def test_removing_a_person_takes_them_out_of_groups(
     assert both.options[CONF_MEMBERS] == [ALEX]
     assert both.runtime_data.members == (ALEX,)
     assert (
-        hass.states.get("sensor.home_eta_first_arrival").attributes["missing_members"]
+        hass.states.get("sensor.home_eta_expected_home").attributes["missing_members"]
         == []
     )
     issues = ir.async_get(hass)
@@ -404,19 +304,195 @@ async def test_rename_onto_a_tracked_id_keeps_unique_ids_distinct(
     assert "which another Home ETA entry already tracks" in caplog.text
 
 
-async def test_moving_the_zone_far_forgets_learned_trips(
-    hass: HomeAssistant, freezer: FrozenDateTimeFactory, hass_storage: dict[str, Any]
-) -> None:
-    set_person(hass, ALEX, None, zones=("zone.home",))
-    entry = await setup(hass, options=HISTORY)
-    await trip(hass, freezer)
-    key = store_key(entry.entry_id)
-    assert hass_storage[key]["data"]["trips_learned"] == 1
-    zone = hass.states.get("zone.home")
-    hass.states.async_set(
-        "zone.home",
-        zone.state,
-        {**zone.attributes, "latitude": zone.attributes["latitude"] + 0.01},
+# -- migration from 1.x ----------------------------------------------------------
+
+
+def legacy_person(person: str, options: dict[str, Any]) -> MockConfigEntry:
+    """Return a person entry as Home ETA 1.x saved it."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title=person.split(".")[1].title(),
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_PERSON,
+            CONF_PERSON: person,
+            CONF_ZONE: "zone.home",
+        },
+        options=options,
+        unique_id=f"{person}|zone.home",
+        version=1,
+        minor_version=1,
     )
+
+
+def legacy_group(members: list[str], **near: int) -> MockConfigEntry:
+    """Return a group entry as Home ETA 1.x saved it."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title="Home ETA",
+        data={CONF_ENTRY_TYPE: ENTRY_TYPE_GROUP, CONF_ZONE: "zone.home"},
+        options={CONF_MEMBERS: members, **near},
+        unique_id="group|zone.home|home_eta",
+        version=1,
+        minor_version=1,
+    )
+
+
+LEGACY_OPTIONS: dict[str, Any] = {
+    "enable_historical": True,
+    "ignored_zones": ["zone.work"],
+    "activity_entity": "sensor.iphone_activity",
+    "reference_eta_entity": "sensor.waze",
+    CONF_ADVANCED: {"min_closing_speed_mps": 0.8, "stale_after_s": 1_200},
+}
+
+
+def register_legacy_entities(
+    hass: HomeAssistant, entry: MockConfigEntry, domain: str, keys: tuple[str, ...]
+) -> list[str]:
+    registry = er.async_get(hass)
+    return [
+        registry.async_get_or_create(
+            domain,
+            DOMAIN,
+            f"{entry.entry_id}_{key}",
+            config_entry=entry,
+            suggested_object_id=f"{entry.title}_{key}",
+        ).entity_id
+        for key in keys
+    ]
+
+
+@pytest.mark.parametrize(
+    "group_first", [True, False], ids=["group_first", "person_first"]
+)
+async def test_migration_from_1_x(
+    hass: HomeAssistant, hass_storage: dict[str, Any], group_first: bool
+) -> None:
+    set_person(hass, ALEX, 5_000)
+    set_person(hass, SAM, 6_000)
+    alex = legacy_person(ALEX, LEGACY_OPTIONS)
+    sam = legacy_person(SAM, {"enable_historical": False, "ignored_zones": []})
+    group = legacy_group([ALEX], near_home_radius_m=5_000, near_home_fade_after_min=0)
+    entries = [group, alex, sam] if group_first else [alex, sam, group]
+    for entry in entries:
+        entry.add_to_hass(hass)
+    retired = register_legacy_entities(hass, alex, "sensor", LEGACY_PERSON_ENTITIES)
+    retired += register_legacy_entities(hass, group, "sensor", LEGACY_GROUP_ENTITIES)
+    kept = register_legacy_entities(hass, alex, "sensor", ("minutes_to_home",))
+    history = f"{DOMAIN}.history.{alex.entry_id}"
+    hass_storage[history] = {"version": 1, "key": history, "data": {"trips": []}}
+
+    assert await hass.config_entries.async_setup(entries[0].entry_id)
     await hass.async_block_till_done()
-    assert hass_storage[key]["data"]["trips_learned"] == 0
+
+    for entry in entries:
+        assert entry.state is ConfigEntryState.LOADED
+        assert (entry.version, entry.minor_version) == (1, CONFIG_MINOR_VERSION)
+    # Alex keeps their changed stale time, and takes the group's near home.
+    assert dict(alex.options) == {
+        CONF_ADVANCED: {"stale_after_s": 1_200},
+        CONF_NEAR_HOME_RADIUS_M: 5_000,
+        CONF_NEAR_HOME_FADE_AFTER_MIN: 0,
+    }
+    # Sam was in no group: the defaults.
+    assert dict(sam.options) == {
+        CONF_NEAR_HOME_RADIUS_M: 3_000,
+        CONF_NEAR_HOME_FADE_AFTER_MIN: 90,
+    }
+    assert dict(group.options) == {CONF_MEMBERS: [ALEX]}
+    assert alex.runtime_data.config.near_home.radius_m == 5_000
+    assert alex.runtime_data.config.params.stale_after_s == 1_200
+    registry = er.async_get(hass)
+    for entity_id in retired:
+        assert registry.async_get(entity_id) is None, entity_id
+    for entity_id in kept:
+        assert registry.async_get(entity_id) is not None, entity_id
+    assert history not in hass_storage
+
+
+async def test_migration_falls_back_to_defaults_for_unusable_group_settings(
+    hass: HomeAssistant,
+) -> None:
+    set_person(hass, ALEX, 5_000)
+    alex = legacy_person(ALEX, {})
+    group = legacy_group([ALEX], near_home_radius_m=50, near_home_fade_after_min=1)
+    for entry in (alex, group):
+        entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(alex.entry_id)
+    await hass.async_block_till_done()
+    assert dict(alex.options) == {
+        CONF_NEAR_HOME_RADIUS_M: 3_000,
+        CONF_NEAR_HOME_FADE_AFTER_MIN: 1,
+    }
+
+
+async def test_entry_from_a_newer_release_loads(hass: HomeAssistant) -> None:
+    """Minor versions are backwards compatible (a downgrade, then an upgrade)."""
+    set_person(hass, ALEX, 5_000)
+    newer = MockConfigEntry(
+        domain=DOMAIN,
+        title="Alex",
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_PERSON,
+            CONF_PERSON: ALEX,
+            CONF_ZONE: "zone.home",
+        },
+        options={"a_future_option": True},
+        unique_id=f"{ALEX}|zone.home",
+        version=1,
+        minor_version=CONFIG_MINOR_VERSION + 1,
+    )
+    newer.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(newer.entry_id)
+    await hass.async_block_till_done()
+    assert newer.state is ConfigEntryState.LOADED
+    assert newer.minor_version == CONFIG_MINOR_VERSION + 1
+    assert newer.options == {"a_future_option": True}
+
+
+async def test_entry_from_an_unknown_older_version_is_refused(
+    hass: HomeAssistant,
+) -> None:
+    set_person(hass, ALEX, 5_000)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Alex",
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_PERSON,
+            CONF_PERSON: ALEX,
+            CONF_ZONE: "zone.home",
+        },
+        version=0,
+    )
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is ConfigEntryState.MIGRATION_ERROR
+
+
+async def test_entry_from_a_newer_major_version_is_refused(hass: HomeAssistant) -> None:
+    set_person(hass, ALEX, 5_000)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Alex",
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_PERSON,
+            CONF_PERSON: ALEX,
+            CONF_ZONE: "zone.home",
+        },
+        version=2,
+    )
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is ConfigEntryState.MIGRATION_ERROR
+
+
+async def test_removing_a_never_migrated_entry_deletes_its_learned_trips(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    entry = legacy_person(ALEX, {"enable_historical": True})
+    entry.add_to_hass(hass)
+    history = f"{DOMAIN}.history.{entry.entry_id}"
+    hass_storage[history] = {"version": 1, "key": history, "data": {"trips": []}}
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert history not in hass_storage

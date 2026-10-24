@@ -590,3 +590,198 @@ def test_overdue_grace_grows_with_the_trip() -> None:
     phone.wait(2 * MIN)
     assert not tracker.heading
     assert tracker.reason is HomewardReason.OVERDUE
+
+
+# -- arriving soon -------------------------------------------------------------
+
+
+def heading_home_from(tracker: HomewardTracker, phone: Phone, far: float) -> None:
+    """Drive out to ``far`` metres, then a quarter of the way back."""
+    phone.at(far, speed=-13.0)
+    phone.at(far * 0.75, speed=13.0)
+    assert tracker.heading
+
+
+def due_in(tracker: HomewardTracker, now: float) -> float:
+    """Return seconds until the expected arrival."""
+    arrival = tracker.snapshot(now).arrival
+    assert arrival is not None
+    return arrival - now
+
+
+def test_arriving_soon_once_due_within_the_threshold() -> None:
+    tracker, phone = out_of_home()
+    tracker.set_threshold(10 * MIN)
+    heading_home_from(tracker, phone, 30_000)
+    east = 22_500.0
+    while not tracker.arriving_soon:
+        assert due_in(tracker, phone.t) > 10 * MIN
+        east -= 1_000
+        phone.at(east, after_s=77.0, speed=13.0)
+    assert due_in(tracker, phone.t) <= 10 * MIN
+    assert east > P.arriving_soon_distance_m
+    assert tracker.snapshot(phone.t).arriving_soon
+
+
+def test_arriving_soon_as_the_time_runs_down_between_fixes() -> None:
+    tracker, phone = out_of_home()
+    heading_home_from(tracker, phone, 30_000)
+    due = due_in(tracker, phone.t)
+    assert due > 16 * MIN
+    phone.wait(due - 15 * MIN - MIN, speed=13.0)
+    assert not tracker.arriving_soon
+    phone.wait(MIN, speed=13.0)
+    assert tracker.arriving_soon
+
+
+def test_close_by_is_arriving_soon_whatever_the_time() -> None:
+    tracker, phone = out_of_home()
+    tracker.set_threshold(MIN)
+    phone.at(2_000, speed=-1.3)
+    phone.at(1_200, after_s=10 * MIN, speed=1.3)
+    assert tracker.heading
+    assert not tracker.arriving_soon
+    phone.at(790, after_s=5 * MIN, speed=1.3)
+    assert tracker.arriving_soon
+    assert due_in(tracker, phone.t) > MIN
+
+
+def test_arriving_soon_holds_until_the_trip_home_ends() -> None:
+    tracker, phone = out_of_home()
+    heading_home_from(tracker, phone, 30_000)
+    phone.wait(due_in(tracker, phone.t), speed=13.0)
+    assert tracker.arriving_soon
+    # A jam: the estimate goes back past the threshold, but it stays on.
+    phone.at(6_000, after_s=MIN, speed=1.5)
+    assert due_in(tracker, phone.t) > 15 * MIN
+    assert tracker.arriving_soon
+    # Turning back ends the trip home, and arriving soon with it.
+    phone.at(9_000, after_s=5 * MIN, speed=-10.0)
+    assert not tracker.heading
+    assert not tracker.arriving_soon
+    assert not tracker.snapshot(phone.t).arriving_soon
+
+
+def test_arriving_home_ends_arriving_soon() -> None:
+    tracker, phone = out_of_home()
+    phone.at(2_000, speed=-1.3)
+    phone.at(700, after_s=15 * MIN, speed=1.4)
+    assert tracker.arriving_soon
+    tracker.arrive(phone.t + 5 * MIN)
+    assert not tracker.arriving_soon
+    assert tracker.reason is HomewardReason.ARRIVED
+
+
+def test_another_zone_holds_arriving_soon_off() -> None:
+    """A shop 600 m from home is not arriving home."""
+    tracker, phone = out_of_home()
+    phone.at(2_000, speed=-1.3)
+    tracker.set_other_zone(True)
+    phone.at(600, after_s=15 * MIN, speed=1.4)
+    assert tracker.heading
+    assert not tracker.arriving_soon
+    tracker.set_other_zone(False)
+    assert not tracker.arriving_soon  # judged at the next fix or tick
+    phone.wait(MIN, speed=1.4)
+    assert tracker.arriving_soon
+    tracker.set_other_zone(True)
+    phone.wait(MIN, speed=1.4)
+    assert not tracker.arriving_soon
+
+
+def test_a_new_threshold_is_judged_afresh() -> None:
+    tracker, phone = out_of_home()
+    heading_home_from(tracker, phone, 30_000)
+    phone.wait(due_in(tracker, phone.t) - 10 * MIN, speed=13.0)
+    assert tracker.arriving_soon
+    tracker.set_threshold(5 * MIN)
+    phone.wait(0.0, speed=13.0)
+    assert not tracker.arriving_soon
+    tracker.set_threshold(5 * MIN)  # unchanged: nothing to judge again
+    tracker.set_threshold(20 * MIN)
+    phone.wait(0.0, speed=13.0)
+    assert tracker.arriving_soon
+    assert tracker.threshold_s == 20 * MIN
+
+
+@pytest.mark.parametrize("seconds", [0.0, -60.0, math.nan, math.inf])
+def test_threshold_must_be_positive(seconds: float) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        HomewardTracker(P, TARGET).set_threshold(seconds)
+
+
+def test_undoing_a_fix_undoes_arriving_soon() -> None:
+    tracker, phone = out_of_home()
+    tracker.set_threshold(5 * MIN)
+    phone.at(2_000, speed=-1.3)
+    phone.at(1_200, after_s=10 * MIN, speed=1.3)
+    assert not tracker.arriving_soon
+    saved = tracker.save()
+    phone.at(700, after_s=5 * MIN, speed=1.3)
+    assert tracker.arriving_soon
+    tracker.load(saved)
+    assert not tracker.arriving_soon
+
+
+def test_arriving_soon_survives_a_restart() -> None:
+    tracker, phone = out_of_home()
+    phone.at(2_000, speed=-1.3)
+    phone.at(700, after_s=15 * MIN, speed=1.4)
+    saved = tracker.restore_data()
+    assert saved is not None
+    assert saved.trip is not None
+    assert saved.trip.arriving_soon
+    restarted = HomewardTracker(P, TARGET)
+    assert restarted.restore(saved, phone.t, 700)
+    restarted.tick(phone.t + MIN, None)
+    assert restarted.arriving_soon
+
+
+# -- saved format --------------------------------------------------------------
+
+
+def test_saved_data_round_trips() -> None:
+    data = HomewardRestore(
+        T0,
+        HomewardTrip(T0 - 600, 30_000, 20_000, arriving_soon=True),
+        HomewardStay(T0 - 3_600, *to_latlon(500, 0), 500.0),
+    )
+    assert HomewardRestore.from_dict(data.as_dict()) == data
+    trip_only = HomewardRestore(T0, HomewardTrip(T0 - 600, 30_000, 20_000))
+    assert HomewardRestore.from_dict(trip_only.as_dict()) == trip_only
+
+
+GOOD_TRIP = {"since": T0, "farthest_m": 30_000, "closest_m": 20_000}
+GOOD_STAY = {"since": T0, "latitude": HOME_LAT, "longitude": HOME_LON, "distance_m": 5}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "nonsense",
+        {"trip": GOOD_TRIP},
+        {"last_heard": "yesterday", "trip": GOOD_TRIP},
+        {"last_heard": True, "trip": GOOD_TRIP},
+        {"last_heard": math.nan, "trip": GOOD_TRIP},
+        {"last_heard": T0},
+        {"last_heard": T0, "trip": "x", "stay": None},
+        {"last_heard": T0, "trip": {**GOOD_TRIP, "since": "yesterday"}},
+        {"last_heard": T0, "trip": {**GOOD_TRIP, "farthest_m": -5}},
+        {"last_heard": T0, "trip": {**GOOD_TRIP, "closest_m": 40_000}},
+        {"last_heard": T0, "trip": {"since": T0, "farthest_m": 30_000}},
+        {"last_heard": T0, "trip": {**GOOD_TRIP, "arriving_soon": "yes"}},
+        {"last_heard": T0, "stay": {**GOOD_STAY, "latitude": 123.0}},
+        {"last_heard": T0, "stay": {**GOOD_STAY, "distance_m": -1}},
+        {"last_heard": T0, "stay": {**GOOD_STAY, "longitude": None}},
+    ],
+)
+def test_unusable_saved_data_restores_nothing(value: object) -> None:
+    assert HomewardRestore.from_dict(value) is None
+
+
+def test_a_bad_part_of_saved_data_is_dropped() -> None:
+    data = HomewardRestore.from_dict(
+        {"last_heard": T0, "trip": {**GOOD_TRIP, "since": None}, "stay": GOOD_STAY}
+    )
+    assert data == HomewardRestore(T0, None, HomewardStay(T0, HOME_LAT, HOME_LON, 5))

@@ -100,7 +100,6 @@ def replay(
 
     def record(t: float) -> None:
         homeward = trk.snapshot(t).homeward
-        assert homeward is not None
         out.append(
             Minute(t, homeward.heading, homeward.reason, homeward.arrival, arrival - t)
         )
@@ -293,12 +292,10 @@ def test_a_glitch_into_a_zone_is_undone() -> None:
     t += 60.0
     report(3_600.0)  # into the 4 km zone
     homeward = trk.snapshot(t).homeward
-    assert homeward is not None
     assert homeward.heading
     t += 60.0
     report(5_005.0)  # back: the jump was a glitch
     homeward = trk.snapshot(t).homeward
-    assert homeward is not None
     assert not homeward.heading
 
 
@@ -331,9 +328,7 @@ class Phone:
 
     @property
     def homeward(self) -> HomewardSnapshot:
-        snap = self.trk.snapshot(self.t).homeward
-        assert snap is not None
-        return snap
+        return self.trk.snapshot(self.t).homeward
 
     def out_and_home_to(self, stop_m: float) -> None:
         """Drive out to 10 km, stay an hour, drive back towards ``stop_m``."""

@@ -7,7 +7,6 @@ import math
 import pytest
 
 from custom_components.home_eta.core.kinematic import (
-    Confidence,
     Fix,
     FixVerdict,
     KinematicEstimator,
@@ -43,7 +42,6 @@ class TestFixAcceptance:
         assert outcome.verdict is FixVerdict.FIRST
         assert outcome.distance_m == pytest.approx(5_000, rel=1e-3)
         assert est.closing_speed_mps is None
-        assert est.estimate(T0) is None
 
     def test_moving_fix_measures_radial_speed(self) -> None:
         est = estimator()
@@ -86,14 +84,14 @@ class TestFixAcceptance:
         assert est.add_fix(fix(4_000, 50)).verdict is FixVerdict.REJECTED_OUT_OF_ORDER
         assert est.add_fix(fix(4_000, 100)).verdict is FixVerdict.REJECTED_OUT_OF_ORDER
 
-    def test_gps_jump_rejected_and_estimate_unchanged(self) -> None:
+    def test_gps_jump_rejected_and_state_unchanged(self) -> None:
         est = estimator()
         drive(est, 10.0, 5_000, 0, 60, 120)
-        before = est.estimate(T0 + 120)
+        before = (est.closing_speed_mps, est.distance_m, est.last_fix_time)
         assert est.add_fix(fix(5_000 - 1_200 - 3_000, 150)).verdict is (
             FixVerdict.REJECTED_JUMP
         )
-        assert est.estimate(T0 + 120) == before
+        assert (est.closing_speed_mps, est.distance_m, est.last_fix_time) == before
 
     def test_same_place_moments_apart_merged_keeping_better_fix(self) -> None:
         est = estimator()
@@ -115,7 +113,6 @@ class TestFixAcceptance:
         outcome = est.add_fix(fix(3_000, 120 + 901))
         assert outcome.verdict is FixVerdict.REINITIALISED
         assert est.closing_speed_mps is None
-        assert est.estimate(T0 + 1_021) is None
 
 
 class TestStopsAndStarts:
@@ -148,7 +145,6 @@ class TestStopsAndStarts:
         est.add_fix(fix(position, 280))
         assert est.closing_speed_mps is not None
         assert abs(est.closing_speed_mps) < 0.5
-        assert est.estimate(T0 + 280) is None
 
     def test_setting_off_after_short_stop_seeds_from_the_move(self) -> None:
         est = estimator()
@@ -206,79 +202,22 @@ class TestStopsAndStarts:
         est.add_fix(fix(4_400 - 1.4 * 360, 420))
         assert est.closing_speed_mps == pytest.approx(1.4, rel=0.05)
 
-    def test_moving_away_gives_negative_speed_and_no_eta(self) -> None:
+    def test_moving_away_gives_negative_speed(self) -> None:
         est = estimator()
         for t in (0, 60, 120, 180):
             est.add_fix(fix(2_000 + 10.0 * t, t))
         assert est.closing_speed_mps == pytest.approx(-10.0, rel=0.01)
-        assert est.estimate(T0 + 180) is None
 
 
-class TestEstimate:
-    """The published estimate."""
+class TestTarget:
+    """Staleness and a moved target."""
 
-    def test_arrival_from_fix_time_and_zone_edge(self) -> None:
-        est = estimator()
-        drive(est, 10.0, 5_100, 0, 60, 120)
-        result = est.estimate(T0 + 200)
-        assert result is not None
-        # 5 100 - 1 200 m from the centre, minus the 100 m radius, at 10 m/s.
-        assert result.remaining_m == pytest.approx(3_800, rel=1e-3)
-        assert result.arrival == pytest.approx(T0 + 120 + 380, abs=1.0)
-        assert result.fix_time == T0 + 120
-
-    def test_band_brackets_arrival(self) -> None:
-        est = estimator()
-        speeds = [12.0, 14.0, 11.0, 15.0, 13.0]
-        position, t = 20_000.0, 0.0
-        est.add_fix(fix(position, t))
-        for speed in speeds:
-            t += 60
-            position -= speed * 60
-            est.add_fix(fix(position, t))
-        result = est.estimate(T0 + t)
-        assert result is not None
-        assert result.speed_spread_mps is not None
-        assert result.earliest < result.arrival < result.latest
-
-    def test_inside_radius_arrives_at_fix_time(self) -> None:
-        est = estimator()
-        drive(est, 2.0, 500, 0, 120, 240)
-        result = est.estimate(T0 + 240)
-        assert result is not None
-        assert result.remaining_m == 0.0
-        assert result.arrival == T0 + 240
-
-    def test_eta_clamped(self) -> None:
-        est = estimator(max_eta_s=600.0)
-        drive(est, 1.0, 50_000, 0, 600)
-        result = est.estimate(T0 + 600)
-        assert result is not None
-        assert result.arrival == T0 + 600 + 600
-
-    def test_confidence_grows_with_consistent_samples(self) -> None:
-        est = estimator()
-        est.add_fix(fix(20_000, 0))
-        est.add_fix(fix(19_400, 60))
-        first = est.estimate(T0 + 60)
-        assert first is not None
-        assert first.confidence is Confidence.LOW
-        est.add_fix(fix(18_800, 120))
-        second = est.estimate(T0 + 120)
-        assert second is not None
-        assert second.confidence is Confidence.MEDIUM
-        for t in (180, 240):
-            est.add_fix(fix(20_000 - 10 * t, t))
-        result = est.estimate(T0 + 240)
-        assert result is not None
-        assert result.confidence is Confidence.HIGH
-
-    def test_stale_estimate_hidden_unless_asked(self) -> None:
+    def test_stale_without_a_recent_fix(self) -> None:
         est = estimator()
         drive(est, 10.0, 5_000, 0, 60, 120)
-        assert est.estimate(T0 + 120 + 901) is None
+        assert not est.is_stale(T0 + 120 + 900)
         assert est.is_stale(T0 + 120 + 901)
-        assert est.estimate(T0 + 120 + 901, allow_stale=True) is not None
+        assert estimator().is_stale(T0)
 
     def test_target_change_resets(self) -> None:
         est = estimator()
@@ -316,27 +255,18 @@ class TestClockAndTime:
         assert not est.is_stale(T0 + 1_000)
         assert est.is_stale(T0)
 
-    def test_overdue_arrival_is_now_with_low_confidence(self) -> None:
-        est = estimator()
-        drive(est, 10.0, 6_100, 0, 60, 120, 180, 240)
-        on_time = est.estimate(T0 + 240)
-        assert on_time is not None
-        # 3 700 m from the centre, 3 600 m to the edge, at 10 m/s.
-        assert on_time.arrival == pytest.approx(T0 + 240 + 360, abs=1)
-        late = est.estimate(T0 + 240 + 600)
-        assert late is not None
-        assert late.arrival == late.earliest == late.latest == T0 + 840
-        assert late.confidence is Confidence.LOW
-
 
 def test_moving_away_is_still_filtered() -> None:
     """Receding speeds are smoothed like closing ones, not re-seeded each fix."""
     est = estimator()
+    samples = []
     for i, t in enumerate((0, 60, 120, 180, 240, 300)):
         wobble = 40.0 if i % 2 else -40.0
-        est.add_fix(fix(1_000 + 10.0 * t + wobble, t))
-    assert est.samples > 1
+        samples.append(est.add_fix(fix(1_000 + 10.0 * t + wobble, t)).speed_sample_mps)
     assert est.closing_speed_mps == pytest.approx(-10.0, rel=0.15)
+    # Smoothed: nearer the true speed than the last sample was.
+    assert samples[-1] is not None
+    assert abs(est.closing_speed_mps + 10.0) < abs(samples[-1] + 10.0)
 
 
 class TestRobustness:
@@ -375,7 +305,6 @@ class TestRobustness:
         outcome = est.add_fix(fix(5_000 - 0.6 * 2_280, 2_280, accuracy_m=140))
         assert outcome.verdict is FixVerdict.STATIONARY
         assert not est.stopped
-        assert est.estimate(T0 + 2_280) is not None
         for t in (2_499, 3_332):
             outcome = est.add_fix(fix(5_000 - 0.6 * t, t, accuracy_m=140))
             assert outcome.verdict is FixVerdict.MOVED
@@ -396,7 +325,6 @@ class TestRobustness:
             assert not est.stopped
         est.add_fix(fix(4_700, 1_490, accuracy_m=100))
         assert est.stopped
-        assert est.estimate(T0 + 1_490) is None
 
     def test_position_glitch_that_returns_is_undone(self) -> None:
         """Indoor Wi-Fi: one fix jumps 300 m away and the next is back."""
@@ -458,7 +386,6 @@ class TestRobustness:
         ]
         assert FixVerdict.MOVED in verdicts[:2]
         assert est.closing_speed_mps == pytest.approx(12.0, rel=0.1)
-        assert est.estimate(T0 + 1_800 + 42 * 5) is not None
 
     def test_seed_replacement_is_bounded(self) -> None:
         """Stop-and-go samples must not make the filter echo the last sample."""

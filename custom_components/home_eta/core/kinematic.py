@@ -1,11 +1,12 @@
-"""Kinematic ETA: remaining distance over filtered radial closing speed.
+"""Kinematics: which fixes to believe, and the filtered radial closing speed.
 
 The estimator only sees sparse, irregular position fixes (iOS reports on
-significant location change, zone events and background fetch). It measures
-the radial closing speed, the rate at which the straight-line distance to the
-target falls, between an *anchor* fix and each new fix, and filters it.
-Using radial distance for both the remaining distance and the speed makes a
-route's detour factor largely cancel on a steady leg, so no map is needed.
+significant location change, zone events and background fetch). It decides
+which fixes are real (accuracy, jumps, glitches that bounce straight back) and
+measures the radial closing speed, the rate at which the straight-line
+distance to the target falls, between an *anchor* fix and each new fix, and
+filters it. Heading home (``homeward.py``) is fed the fixes accepted here and
+the filtered speed while it is fresh.
 
 Noise model: phones report horizontal accuracy as a ~68 % radius (1.51 sigma).
 Movement is only believed when two fixes differ by more than 3 combined sigmas,
@@ -27,16 +28,14 @@ The anchor stays where movement was last seen, so steps each below the noise
 add up. A stop is proven by a still fix ten minutes after the last movement
 when, at the believed speed, the movement would have shown (or that speed is
 below the closing speed), and by no movement at all for the stale period.
-While stopped there is no ETA.
+While stopped the speed is not used.
 """
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 import math
-from statistics import stdev
 
 from .geo import haversine_m, is_valid_coordinate
 from .params import ACCURACY_TO_SIGMA, EstimatorParams
@@ -91,14 +90,6 @@ ACCEPTED_VERDICTS = frozenset(
 )
 
 
-class Confidence(StrEnum):
-    """How much to trust an ETA."""
-
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
 @dataclass(frozen=True, slots=True)
 class FixOutcome:
     """Result of offering a fix to the estimator."""
@@ -119,21 +110,6 @@ class FixOutcome:
         return self.verdict in ACCEPTED_VERDICTS
 
 
-@dataclass(frozen=True, slots=True)
-class KinematicEstimate:
-    """An arrival estimate. Times are UTC epoch seconds."""
-
-    arrival: float
-    earliest: float
-    latest: float
-    remaining_m: float
-    closing_speed_mps: float
-    speed_spread_mps: float | None
-    samples: int
-    confidence: Confidence
-    fix_time: float
-
-
 @dataclass(slots=True)
 class _Point:
     latitude: float
@@ -151,7 +127,6 @@ class _Saved:
     last: _Point | None
     speed: float | None
     last_feed: float | None
-    window: tuple[float, ...]
     last_movement: float | None
     stopped: bool
     divergent: tuple[float, ...]
@@ -162,7 +137,7 @@ class _Saved:
 
 
 class KinematicEstimator:
-    """Estimate arrival time from position fixes for one person."""
+    """Track one person's accepted fixes and closing speed."""
 
     def __init__(self, params: EstimatorParams, target: Target) -> None:
         """Initialise with parameters and the target zone."""
@@ -172,7 +147,6 @@ class KinematicEstimator:
         self._last: _Point | None = None
         self._speed: float | None = None
         self._last_feed: float | None = None
-        self._window: deque[float] = deque(maxlen=params.speed_window_n)
         self._last_movement: float | None = None
         self._stopped = False
         self._divergent: list[float] = []
@@ -213,11 +187,6 @@ class KinematicEstimator:
         return self._last_movement
 
     @property
-    def samples(self) -> int:
-        """Return how many speed samples are in the spread window."""
-        return len(self._window)
-
-    @property
     def stopped(self) -> bool:
         """Return True after a still fix proved a stop of ``stationary_after_s``."""
         return self._stopped
@@ -228,7 +197,6 @@ class KinematicEstimator:
         self._last = None
         self._speed = None
         self._last_feed = None
-        self._window.clear()
         self._last_movement = None
         self._stopped = False
         self._divergent.clear()
@@ -258,7 +226,6 @@ class KinematicEstimator:
         """Return internal state for diagnostics (coordinates excluded)."""
         return {
             "closing_speed_mps": self._speed,
-            "speed_window_mps": list(self._window),
             "anchor_time": None if self._anchor is None else self._anchor.timestamp,
             "anchor_distance_m": None
             if self._anchor is None
@@ -460,7 +427,6 @@ class KinematicEstimator:
             last=self._last,
             speed=self._speed,
             last_feed=self._last_feed,
-            window=tuple(self._window),
             last_movement=self._last_movement,
             stopped=self._stopped,
             divergent=tuple(self._divergent),
@@ -475,8 +441,6 @@ class KinematicEstimator:
         self._last = saved.last
         self._speed = saved.speed
         self._last_feed = saved.last_feed
-        self._window.clear()
-        self._window.extend(saved.window)
         self._last_movement = saved.last_movement
         self._stopped = saved.stopped
         self._divergent = list(saved.divergent)
@@ -577,7 +541,6 @@ class KinematicEstimator:
         self._since_seed += 1
         self._speed = speed + alpha * delta
         self._last_feed = timestamp
-        self._window.append(sample)
         return True
 
     def _seed(
@@ -594,71 +557,7 @@ class KinematicEstimator:
         self._weight_sum = self._weight(noise)
         self._replacements = self._replacements + 1 if replacement else 0
         self._last_feed = timestamp
-        self._window.clear()
-        self._window.append(sample)
         self._divergent.clear()
-
-    # -- output ------------------------------------------------------------
-
-    def estimate(
-        self, now: float, *, allow_stale: bool = False
-    ) -> KinematicEstimate | None:
-        """Return the arrival estimate, or None when it is undefined."""
-        p = self._p
-        last = self._last
-        speed = self._speed
-        if (
-            last is None
-            or speed is None
-            or self._stopped
-            or speed < p.min_closing_speed_mps
-        ):
-            return None
-        if not allow_stale and self.is_stale(now):
-            return None
-
-        remaining = max(last.distance_m - self._target.radius_m, 0.0)
-        spread = stdev(self._window) if len(self._window) >= 2 else None
-
-        def arrive_at(speed_mps: float) -> float:
-            return last.timestamp + min(remaining / speed_mps, p.max_eta_s)
-
-        arrival = arrive_at(speed)
-        if spread:
-            earliest = arrive_at(speed + spread)
-            latest = arrive_at(max(speed - spread, p.min_closing_speed_mps))
-        else:
-            earliest = latest = arrival
-        # Between sparse fixes the projection can fall behind the clock; never
-        # publish an arrival in the past, and say it is a guess.
-        overdue = arrival < now
-        arrival, earliest, latest = (max(t, now) for t in (arrival, earliest, latest))
-
-        samples = len(self._window)
-        if overdue:
-            confidence = Confidence.LOW
-        elif (
-            samples >= p.confidence_high_min_samples
-            and spread is not None
-            and spread / speed < p.confidence_high_max_spread
-        ):
-            confidence = Confidence.HIGH
-        elif samples >= p.confidence_medium_min_samples:
-            confidence = Confidence.MEDIUM
-        else:
-            confidence = Confidence.LOW
-
-        return KinematicEstimate(
-            arrival=arrival,
-            earliest=earliest,
-            latest=latest,
-            remaining_m=remaining,
-            closing_speed_mps=speed,
-            speed_spread_mps=spread,
-            samples=samples,
-            confidence=confidence,
-            fix_time=last.timestamp,
-        )
 
 
 def _combined_sigma(accuracy_a_m: float, accuracy_b_m: float) -> float:

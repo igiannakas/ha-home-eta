@@ -20,16 +20,12 @@ from homeassistant.util import slugify
 import probatio
 
 from .const import (
-    CONF_ACTIVITY_ENTITY,
     CONF_ADVANCED,
-    CONF_ENABLE_HISTORICAL,
     CONF_ENTRY_TYPE,
-    CONF_IGNORED_ZONES,
     CONF_MEMBERS,
     CONF_NEAR_HOME_FADE_AFTER_MIN,
     CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
-    CONF_REFERENCE_ETA_ENTITY,
     CONF_ZONE,
     DEFAULT_GROUP_NAME,
     DEFAULT_NEAR_HOME_FADE_AFTER_MIN,
@@ -43,20 +39,12 @@ from .const import (
     MIN_NEAR_HOME_RADIUS_M,
 )
 from .core import params as defaults
+from .migration import CONFIG_MINOR_VERSION, CONFIG_VERSION
 from .runtime import friendly_name, params_from_options, target_from_state
 
 # (key, default, min, max, step, unit) for the advanced section.
 ADVANCED_FIELDS: tuple[tuple[str, float, float, float, float, str], ...] = (
     ("max_gps_accuracy_m", defaults.MAX_GPS_ACCURACY_M, 10, 1_000, 5, "m"),
-    # Must stay above the speed below which someone counts as stopped.
-    (
-        "min_closing_speed_mps",
-        defaults.MIN_CLOSING_SPEED_MPS,
-        round(defaults.STOPPED_SPEED_MPS + 0.1, 1),
-        5,
-        0.1,
-        "m/s",
-    ),
     ("speed_filter_tau_s", defaults.SPEED_FILTER_TAU_S, 30, 1_800, 10, "s"),
     (
         "arriving_soon_distance_m",
@@ -105,38 +93,6 @@ def _near_home_fields() -> dict[probatio.Marker, Any]:
     }
 
 
-def _group_options(user_input: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a group's options from a submitted form."""
-    return {
-        CONF_MEMBERS: list(user_input.get(CONF_MEMBERS) or []),
-        CONF_NEAR_HOME_RADIUS_M: int(
-            user_input.get(CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M)
-        ),
-        CONF_NEAR_HOME_FADE_AFTER_MIN: int(
-            user_input.get(
-                CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN
-            )
-        ),
-    }
-
-
-def _person_option_fields() -> dict[probatio.Marker, Any]:
-    return {
-        probatio.Optional(CONF_ACTIVITY_ENTITY): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor")
-        ),
-        probatio.Optional(CONF_REFERENCE_ETA_ENTITY): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor")
-        ),
-        probatio.Required(
-            CONF_ENABLE_HISTORICAL, default=False
-        ): selector.BooleanSelector(),
-        probatio.Optional(CONF_IGNORED_ZONES, default=[]): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="zone", multiple=True)
-        ),
-    }
-
-
 def _advanced_section() -> dict[probatio.Marker, Any]:
     fields: dict[probatio.Marker, Any] = {}
     for key, default, low, high, step, unit in ADVANCED_FIELDS:
@@ -157,13 +113,17 @@ def _advanced_section() -> dict[probatio.Marker, Any]:
 
 
 def _person_options(user_input: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a person's options from a submitted form."""
     options: dict[str, Any] = {
-        CONF_ENABLE_HISTORICAL: bool(user_input.get(CONF_ENABLE_HISTORICAL, False)),
-        CONF_IGNORED_ZONES: list(user_input.get(CONF_IGNORED_ZONES) or []),
+        CONF_NEAR_HOME_RADIUS_M: int(
+            user_input.get(CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M)
+        ),
+        CONF_NEAR_HOME_FADE_AFTER_MIN: int(
+            user_input.get(
+                CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN
+            )
+        ),
     }
-    for key in (CONF_ACTIVITY_ENTITY, CONF_REFERENCE_ETA_ENTITY):
-        if value := user_input.get(key):
-            options[key] = value
     # Keep only values changed from the defaults, so improved defaults in a
     # later release still reach everyone who never changed them.
     advanced = user_input.get(CONF_ADVANCED) or {}
@@ -175,15 +135,6 @@ def _person_options(user_input: Mapping[str, Any]) -> dict[str, Any]:
     if changed:
         options[CONF_ADVANCED] = changed
     return options
-
-
-def _validate_zones(
-    hass: HomeAssistant, zone: str, ignored: list[str], errors: dict[str, str]
-) -> None:
-    if target_from_state(hass.states.get(zone)) is None:
-        errors[CONF_ZONE] = "zone_invalid"
-    if zone in ignored:
-        errors[CONF_IGNORED_ZONES] = "target_ignored"
 
 
 def _person_entries(hass: HomeAssistant) -> list[ConfigEntry]:
@@ -223,10 +174,10 @@ def _validate_members(
 
 
 class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Add a person or a first-arrival group."""
+    """Add a person or a group."""
 
-    VERSION = 1
-    MINOR_VERSION = 1
+    VERSION = CONFIG_VERSION
+    MINOR_VERSION = CONFIG_MINOR_VERSION
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -246,9 +197,8 @@ class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
             zone = user_input[CONF_ZONE]
             if self.hass.states.get(person) is None:
                 errors[CONF_PERSON] = "person_invalid"
-            _validate_zones(
-                self.hass, zone, list(user_input.get(CONF_IGNORED_ZONES) or []), errors
-            )
+            if target_from_state(self.hass.states.get(zone)) is None:
+                errors[CONF_ZONE] = "zone_invalid"
             if not errors:
                 await self.async_set_unique_id(f"{person}|{zone}")
                 self._abort_if_unique_id_configured()
@@ -275,7 +225,7 @@ class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
                 ): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="zone")
                 ),
-                **_person_option_fields(),
+                **_near_home_fields(),
             }
         )
         return self.async_show_form(
@@ -287,16 +237,16 @@ class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_group(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Pick the first arrival among several people."""
+        """Combine several people heading to the same zone."""
         if not _person_entries(self.hass):
             return self.async_abort(reason="no_people")
         errors: dict[str, str] = {}
         if user_input is not None:
             zone = user_input[CONF_ZONE]
-            options = _group_options(user_input)
+            members = list(user_input.get(CONF_MEMBERS) or [])
             if target_from_state(self.hass.states.get(zone)) is None:
                 errors[CONF_ZONE] = "zone_invalid"
-            _validate_members(self.hass, zone, options[CONF_MEMBERS], errors)
+            _validate_members(self.hass, zone, members, errors)
             if not errors:
                 await self.async_set_unique_id(
                     f"group|{zone}|{slugify(user_input[CONF_NAME])}"
@@ -305,7 +255,7 @@ class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(
                     title=user_input[CONF_NAME],
                     data={CONF_ENTRY_TYPE: ENTRY_TYPE_GROUP, CONF_ZONE: zone},
-                    options=options,
+                    options={CONF_MEMBERS: members},
                 )
 
         schema = probatio.Schema(
@@ -317,7 +267,6 @@ class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
                     selector.EntitySelectorConfig(domain="zone")
                 ),
                 probatio.Required(CONF_MEMBERS): _members_selector(self.hass, None),
-                **_near_home_fields(),
             }
         )
         return self.async_show_form(
@@ -344,24 +293,19 @@ class PersonOptionsFlow(OptionsFlowWithReload):
         """Show and save the options."""
         errors: dict[str, str] = {}
         placeholders: dict[str, str] = {"error": ""}
-        zone = self.config_entry.data[CONF_ZONE]
         if user_input is not None:
-            ignored = list(user_input.get(CONF_IGNORED_ZONES) or [])
             options = _person_options(user_input)
-            if zone in ignored:
-                errors[CONF_IGNORED_ZONES] = "target_ignored"
-            else:
-                try:
-                    params_from_options(options)
-                except (TypeError, ValueError) as err:
-                    # The fields interact (and with fixed parameters); a value
-                    # inside each field's own range can still be unusable.
-                    errors["base"] = "invalid_advanced"
-                    placeholders["error"] = str(err)
+            try:
+                params_from_options(options)
+            except (TypeError, ValueError) as err:
+                # The fields interact (and with fixed parameters); a value
+                # inside each field's own range can still be unusable.
+                errors["base"] = "invalid_advanced"
+                placeholders["error"] = str(err)
             if not errors:
                 return self.async_create_entry(data=options)
 
-        schema = probatio.Schema({**_person_option_fields(), **_advanced_section()})
+        schema = probatio.Schema({**_near_home_fields(), **_advanced_section()})
         current = dict(self.config_entry.options)
         current.setdefault(CONF_ADVANCED, {})
         return self.async_show_form(
@@ -375,42 +319,30 @@ class PersonOptionsFlow(OptionsFlowWithReload):
 
 
 class GroupOptionsFlow(OptionsFlowWithReload):
-    """Change who is in a group and how near home is measured."""
+    """Change who is in a group."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Show and save the members and near-home settings."""
+        """Show and save the members."""
         errors: dict[str, str] = {}
         zone = self.config_entry.data[CONF_ZONE]
         if user_input is not None:
-            options = _group_options(user_input)
-            _validate_members(self.hass, zone, options[CONF_MEMBERS], errors)
+            members = list(user_input.get(CONF_MEMBERS) or [])
+            _validate_members(self.hass, zone, members, errors)
             if not errors:
-                return self.async_create_entry(data=options)
+                return self.async_create_entry(data={CONF_MEMBERS: members})
 
         schema = probatio.Schema(
-            {
-                probatio.Required(CONF_MEMBERS): _members_selector(self.hass, zone),
-                **_near_home_fields(),
-            }
+            {probatio.Required(CONF_MEMBERS): _members_selector(self.hass, zone)}
         )
         if user_input is None:
             # Offer only members that are still tracked, so the form can be
             # saved as shown even if a person was removed meanwhile.
             tracked = _tracked_persons(self.hass, zone)
-            saved = self.config_entry.options
-            current = [
-                member for member in saved.get(CONF_MEMBERS) or [] if member in tracked
-            ]
+            saved = self.config_entry.options.get(CONF_MEMBERS) or []
             suggested: Mapping[str, Any] = {
-                CONF_MEMBERS: current,
-                CONF_NEAR_HOME_RADIUS_M: saved.get(
-                    CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M
-                ),
-                CONF_NEAR_HOME_FADE_AFTER_MIN: saved.get(
-                    CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN
-                ),
+                CONF_MEMBERS: [member for member in saved if member in tracked]
             }
         else:
             suggested = user_input

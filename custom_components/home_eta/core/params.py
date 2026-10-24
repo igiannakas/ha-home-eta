@@ -1,4 +1,4 @@
-"""Tunable parameters for the Home ETA estimators.
+"""Tunable parameters for Home ETA.
 
 Every default lives here as a module constant so the integration's options
 flow, the tests and the backtest script all share one source of truth.
@@ -39,9 +39,6 @@ SPEED_NOISE_REF_MPS = 0.3
 MIN_SAMPLE_WEIGHT = 0.25
 """Floor on the weight of a noisy speed sample."""
 
-SPEED_WINDOW_N = 6
-"""Number of recent speed samples used for spread and confidence."""
-
 MODE_CHANGE_RATIO = 0.5
 """A sample differing from the filtered speed by more than this fraction..."""
 
@@ -75,7 +72,7 @@ STOP_EVIDENCE_FACTOR = 3.0
 person should have moved this many noise radii since the anchor."""
 
 MIN_CLOSING_SPEED_MPS = 0.5
-"""Below this closing speed the ETA is undefined."""
+"""Slower than this, a long time without visible movement is a stop."""
 
 STOPPED_SPEED_MPS = 0.2
 """Below this speed (either direction) the filter treats the person as stopped."""
@@ -84,31 +81,21 @@ CLOCK_STEP_BACK_S = 60.0
 """A fix this much older than the previous one means the clock stepped back."""
 
 MAX_ETA_S = 21_600.0
-"""ETAs are clamped to this many seconds."""
+"""Expected trips home are clamped to this many seconds."""
 
 STALE_AFTER_S = 900.0
-"""With no fix for this long the estimate is stale."""
+"""With no fix for this long the measured speed is stale and no longer used."""
 
-# --- Confidence -------------------------------------------------------------
-CONFIDENCE_HIGH_MIN_SAMPLES = 4
-CONFIDENCE_HIGH_MAX_SPREAD = 0.3
-"""High confidence needs speed spread / speed below this."""
+STATIONARY_AFTER_S = 600.0
+"""No movement for this long is a stop: the next movement starts a new leg."""
 
-CONFIDENCE_MEDIUM_MIN_SAMPLES = 2
-
-# --- Approach state machine -------------------------------------------------
-APPROACH_CONFIRM_N = 2
-"""Consecutive accepted fixes needed to enter or leave approaching."""
-
+# --- Arriving soon ----------------------------------------------------------
 ARRIVING_SOON_DISTANCE_M = 800.0
-"""Within this distance of the zone centre, approaching becomes arriving soon."""
+"""Within this distance of the zone centre, someone heading home is arriving soon."""
 
 DEFAULT_ARRIVING_SOON_MIN = 15
 MIN_ARRIVING_SOON_MIN = 1
 MAX_ARRIVING_SOON_MIN = 120
-
-STATIONARY_AFTER_S = 600.0
-"""No movement for this long marks the person stationary."""
 
 # --- Heading home (core/homeward.py) ----------------------------------------
 PLACE_RADIUS_M = 150.0
@@ -164,27 +151,13 @@ ON_FOOT_MAX_DISTANCE_M = 3_000.0
 ON_FOOT_MIN_SPEED_MPS = 1.1
 """Slowest walking speed assumed for someone heading home on foot."""
 
-# --- Historical estimator ---------------------------------------------------
-MIN_TRIP_DURATION_S = 300.0
-MIN_TRIP_FIXES = 4
-HIST_MAX_TRIPS = 50
-"""Learned trips kept; the oldest is forgotten first."""
-HIST_MAX_TRIP_POINTS = 100
-"""Points kept per learned trip (thinned evenly beyond this)."""
-MIN_HIST_TRIPS = 5
-"""Past trips that must cover a distance before a historical ETA is given."""
-HIST_LOW_QUANTILE = 0.2
-HIST_HIGH_QUANTILE = 0.8
-HIST_RESET_MOVE_M = 200.0
-"""Moving the target zone's centre further than this forgets learned trips."""
-
 
 @dataclass(frozen=True, slots=True)
 class EstimatorParams:
-    """Parameters for one person's estimators.
+    """Parameters for tracking one person.
 
     Validated on construction so a bad options entry fails loudly at setup
-    instead of producing nonsense ETAs.
+    instead of producing nonsense estimates.
     """
 
     max_gps_accuracy_m: float = MAX_GPS_ACCURACY_M
@@ -194,7 +167,6 @@ class EstimatorParams:
     speed_filter_tau_s: float = SPEED_FILTER_TAU_S
     speed_noise_ref_mps: float = SPEED_NOISE_REF_MPS
     min_sample_weight: float = MIN_SAMPLE_WEIGHT
-    speed_window_n: int = SPEED_WINDOW_N
     mode_change_ratio: float = MODE_CHANGE_RATIO
     mode_change_min_delta_mps: float = MODE_CHANGE_MIN_DELTA_MPS
     mode_change_noise_sigmas: float = MODE_CHANGE_NOISE_SIGMAS
@@ -207,20 +179,8 @@ class EstimatorParams:
     clock_step_back_s: float = CLOCK_STEP_BACK_S
     max_eta_s: float = MAX_ETA_S
     stale_after_s: float = STALE_AFTER_S
-    confidence_high_min_samples: int = CONFIDENCE_HIGH_MIN_SAMPLES
-    confidence_high_max_spread: float = CONFIDENCE_HIGH_MAX_SPREAD
-    confidence_medium_min_samples: int = CONFIDENCE_MEDIUM_MIN_SAMPLES
-    approach_confirm_n: int = APPROACH_CONFIRM_N
-    arriving_soon_distance_m: float = ARRIVING_SOON_DISTANCE_M
     stationary_after_s: float = STATIONARY_AFTER_S
-    min_trip_duration_s: float = MIN_TRIP_DURATION_S
-    min_trip_fixes: int = MIN_TRIP_FIXES
-    hist_max_trips: int = HIST_MAX_TRIPS
-    hist_max_trip_points: int = HIST_MAX_TRIP_POINTS
-    min_hist_trips: int = MIN_HIST_TRIPS
-    hist_low_quantile: float = HIST_LOW_QUANTILE
-    hist_high_quantile: float = HIST_HIGH_QUANTILE
-    hist_reset_move_m: float = HIST_RESET_MOVE_M
+    arriving_soon_distance_m: float = ARRIVING_SOON_DISTANCE_M
     glitch_jitter_margin: float = GLITCH_JITTER_MARGIN
     max_jitter_factor: float = MAX_JITTER_FACTOR
     place_radius_m: float = PLACE_RADIUS_M
@@ -253,18 +213,12 @@ class EstimatorParams:
                 raise ValueError(f"{item.name} must be a positive number, got {value}")
         if not 0 < self.min_sample_weight <= 1:
             raise ValueError("min_sample_weight must be in (0, 1]")
-        if not 0 < self.hist_low_quantile < self.hist_high_quantile < 1:
-            raise ValueError("historical quantiles must satisfy 0 < low < high < 1")
         if self.stale_after_s < self.stationary_after_s:
             raise ValueError(
                 "stale_after_s must not be shorter than stationary_after_s"
             )
         if self.stopped_speed_mps >= self.min_closing_speed_mps:
             raise ValueError("stopped_speed_mps must be below min_closing_speed_mps")
-        if self.speed_window_n < 2:
-            raise ValueError("speed_window_n must be at least 2")
-        if self.hist_max_trip_points < 2:
-            raise ValueError("hist_max_trip_points must be at least 2")
         if self.glitch_jitter_margin < 1 or self.max_jitter_factor < 1:
             raise ValueError("jitter margin and factor must be at least 1")
         if self.homeward_min_progress_ratio >= 1 or self.homeward_cancel_ratio >= 1:

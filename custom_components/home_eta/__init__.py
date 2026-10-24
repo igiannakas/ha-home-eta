@@ -1,7 +1,8 @@
-"""Home ETA: estimate when each person, and the first of them, will arrive home.
+"""Home ETA: say who is heading home, when they will be there and how near they are.
 
-Each person is its own config entry with its own sensors. A separate "first
-arrival" entry groups people heading to the same zone.
+Each person is its own config entry with its own entities. A separate group
+entry combines people heading to the same zone: the first expected, whether
+anyone is arriving soon, and how near the nearest is.
 """
 
 from __future__ import annotations
@@ -16,25 +17,22 @@ from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv, issue_registry as ir
 from homeassistant.helpers.entity_registry import EventEntityRegistryUpdatedData
 from homeassistant.helpers.event import async_track_entity_registry_updated_event
-from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import slugify
 
 from .const import (
-    CONF_ACTIVITY_ENTITY,
     CONF_ENTRY_TYPE,
-    CONF_IGNORED_ZONES,
     CONF_MEMBERS,
     CONF_PERSON,
-    CONF_REFERENCE_ETA_ENTITY,
     CONF_ZONE,
     DOMAIN,
     ENTRY_TYPE_GROUP,
     ENTRY_TYPE_PERSON,
-    STORE_VERSION,
 )
-from .runtime import DATA_KEY, GroupRuntime, HomeEtaData, PersonRuntime, store_key
-from .services import async_setup_services
+from .migration import async_migrate_entry, legacy_store
+from .runtime import DATA_KEY, GroupRuntime, HomeEtaData, PersonRuntime
+
+__all__ = ["async_migrate_entry"]
 
 type HomeEtaConfigEntry = ConfigEntry[PersonRuntime | GroupRuntime]
 
@@ -49,9 +47,8 @@ ISSUES = ("person_missing", "zone_missing", "group_no_members")
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up shared data and services."""
+    """Set up the registry of loaded people."""
     hass.data[DATA_KEY] = HomeEtaData()
-    async_setup_services(hass)
     return True
 
 
@@ -87,7 +84,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: HomeEtaConfigEntry) -> 
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete learned history and open issues; take a person out of groups."""
+    """Delete open issues and take a removed person out of groups."""
     for issue in ISSUES:
         ir.async_delete_issue(hass, DOMAIN, f"{issue}_{entry.entry_id}")
     if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_GROUP:
@@ -110,22 +107,16 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         )
         if group.state is ConfigEntryState.LOADED:
             hass.config_entries.async_schedule_reload(group.entry_id)
-    store: Store[dict[str, object]] = Store(
-        hass, STORE_VERSION, store_key(entry.entry_id)
-    )
-    await store.async_remove()
+    # An entry from before 2.0 that was never set up again (disabled, say)
+    # still has its learned trips: they are location history, so they go.
+    await legacy_store(hass, entry.entry_id).async_remove()
 
 
 def _references(entry: ConfigEntry) -> set[str]:
     """Return every entity id an entry refers to."""
     if entry.data[CONF_ENTRY_TYPE] == ENTRY_TYPE_GROUP:
         return {entry.data[CONF_ZONE], *(entry.options.get(CONF_MEMBERS) or [])}
-    refs = {entry.data[CONF_PERSON], entry.data[CONF_ZONE]}
-    refs.update(entry.options.get(CONF_IGNORED_ZONES) or [])
-    for key in (CONF_ACTIVITY_ENTITY, CONF_REFERENCE_ETA_ENTITY):
-        if value := entry.options.get(key):
-            refs.add(value)
-    return refs
+    return {entry.data[CONF_PERSON], entry.data[CONF_ZONE]}
 
 
 def _rename_follower(

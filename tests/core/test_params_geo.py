@@ -26,10 +26,12 @@ def test_defaults_are_valid() -> None:
         {"min_closing_speed_mps": math.nan},
         {"stale_after_s": math.inf},
         {"min_sample_weight": 1.5},
-        {"hist_low_quantile": 0.9, "hist_high_quantile": 0.8},
-        {"speed_window_n": 1},
-        {"hist_max_trip_points": 1},
-        {"hist_max_trips": 0},
+        {"mode_change_confirm_n": 0},
+        {"place_still_s": 1_000.0},
+        {"place_confirm_s": 1_300.0},
+        {"homeward_min_progress_ratio": 1.0},
+        {"homeward_cancel_ratio": 1.5},
+        {"on_foot_min_speed_mps": 3.0},
         {"glitch_jitter_margin": 0.9},
         {"max_jitter_factor": 0.5},
         {"stale_after_s": 300.0},
@@ -51,13 +53,13 @@ def test_non_numbers_rejected(value: object) -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"speed_window_n": 4.5},
-        {"hist_max_trips": 40.0},
-        {"approach_confirm_n": True},
+        {"mode_change_confirm_n": 2.5},
+        {"seed_settle_n": 2.0},
+        {"max_seed_replacements": True},
     ],
 )
 def test_integer_fields_need_integers(overrides: dict[str, object]) -> None:
-    """Regression: 4.5 passed validation and then broke the speed window."""
+    """Regression: 4.5 passed validation and then broke a count."""
     with pytest.raises(TypeError, match="integer"):
         EstimatorParams(**overrides)  # type: ignore[arg-type]
 

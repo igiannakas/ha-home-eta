@@ -3,7 +3,7 @@
     "binary_sensor": {
       "arriving_soon": {
         "default": "mdi:home-outline",
-        "state": { "on": "mdi:home-import-outline" }
+        "state": { "on": "mdi:home-clock-outline" }
       },
       "heading_home": {
         "default": "mdi:home-outline",
@@ -18,31 +18,10 @@
       "arriving_soon_threshold": { "default": "mdi:timer-cog-outline" }
     },
     "sensor": {
-      "approach_state": {
-        "default": "mdi:map-marker-question-outline",
-        "state": {
-          "approaching": "mdi:home-import-outline",
-          "arriving_soon": "mdi:home-clock-outline",
-          "away": "mdi:home-export-outline",
-          "home": "mdi:home",
-          "stationary": "mdi:pause-circle-outline"
-        }
-      },
-      "closing_speed": { "default": "mdi:speedometer" },
       "distance_to_home": { "default": "mdi:map-marker-distance" },
-      "eta_confidence": { "default": "mdi:gauge" },
-      "eta_historical": { "default": "mdi:history" },
-      "eta_kinematic": { "default": "mdi:home-clock" },
-      "expected_home": { "default": "mdi:home-clock-outline" },
-      "first_arrival": { "default": "mdi:home-clock" },
-      "first_arrival_minutes": { "default": "mdi:timer-sand" },
-      "first_arrival_person": { "default": "mdi:account-arrow-right" },
+      "expected_home": { "default": "mdi:home-clock" },
       "minutes_to_home": { "default": "mdi:timer-sand" },
       "near_home": { "default": "mdi:home-map-marker" }
     }
-  },
-  "services": {
-    "export_history": { "service": "mdi:export" },
-    "reset_history": { "service": "mdi:history" }
   }
 }

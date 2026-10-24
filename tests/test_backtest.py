@@ -111,10 +111,11 @@ def test_good_trips_pass(
     assert person["trips"] == 8
     assert person["false_arriving_soon"] == 0
     assert person["missed_arriving_soon"] == 0
-    # History is learned online: only trips after the fifth have it.
+    # Expected home only once heading home: not at the first fix of a trip.
     samples = person["samples"]
-    assert samples[0]["historical_s"] is None
-    assert samples[-1]["historical_s"] is not None
+    assert samples[0]["expected_s"] is None
+    assert samples[-1]["expected_s"] is not None
+    assert abs(samples[-1]["expected_s"] - samples[-1]["true_s"]) < 120
 
 
 def test_heading_home_is_scored(
@@ -211,8 +212,8 @@ def test_arrivals_without_arriving_soon_are_counted(
                     gps_accuracy=10,
                 )
             )
-        # Home a minute after the last fix: before the ETA (about 5 min) had
-        # counted down to the threshold.
+        # Home a minute after the last fix: before the expected arrival
+        # (about 8 min) had counted down to the threshold.
         rows.append(row("home", start + 60 * 5))
     _, result = run(backtest, tmp_path, [rows], "--person-threshold", f"{PERSON}=1")
     assert result[PERSON]["trips"] == 5
@@ -234,7 +235,6 @@ def test_unknown_and_unavailable_rows_are_dropped(backtest: ModuleType) -> None:
         zone,
         params=core["params"].EstimatorParams(),
         threshold_s=900.0,
-        ignored=frozenset(),
     )
     assert result.rows == 0
     assert result.trips == 0
@@ -344,7 +344,7 @@ def test_parameters_and_thresholds_apply(
         "--param",
         "stale_after_s=1200",
         "--param",
-        "speed_window_n=4",
+        "homeward_min_speed_mps=0.4",
     )
     assert result[PERSON]["threshold_min"] == 5
     assert "arriving soon (5 min)" in capsys.readouterr().out
@@ -356,7 +356,7 @@ def test_parameters_and_thresholds_apply(
         ["--param", "no_such_thing=1"],
         ["--param", "stale_after_s=soon"],
         ["--param", "stale_after_s=60"],  # shorter than stationary_after_s
-        ["--param", "speed_window_n=4.5"],
+        ["--param", "mode_change_confirm_n=2.5"],
         ["--param", "nonsense"],
         ["--person-threshold", f"{PERSON}=0"],
         ["--threshold-min", "0"],

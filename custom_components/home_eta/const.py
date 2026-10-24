@@ -20,25 +20,17 @@ CONF_PERSON: Final = "person"
 CONF_ZONE: Final = "zone"
 
 # Person entries: options
-CONF_ACTIVITY_ENTITY: Final = "activity_entity"
-CONF_REFERENCE_ETA_ENTITY: Final = "reference_eta_entity"
-CONF_ENABLE_HISTORICAL: Final = "enable_historical"
-CONF_IGNORED_ZONES: Final = "ignored_zones"
+CONF_NEAR_HOME_RADIUS_M: Final = "near_home_radius_m"
+CONF_NEAR_HOME_FADE_AFTER_MIN: Final = "near_home_fade_after_min"
 CONF_ADVANCED: Final = "advanced"
 
 # Advanced options map one-to-one onto EstimatorParams fields.
 ADVANCED_PARAMS: Final = (
     "max_gps_accuracy_m",
-    "min_closing_speed_mps",
     "speed_filter_tau_s",
     "arriving_soon_distance_m",
     "stale_after_s",
 )
-
-# Group entries: options
-CONF_MEMBERS: Final = "members"
-CONF_NEAR_HOME_RADIUS_M: Final = "near_home_radius_m"
-CONF_NEAR_HOME_FADE_AFTER_MIN: Final = "near_home_fade_after_min"
 
 DEFAULT_NEAR_HOME_RADIUS_M: Final = 3_000
 MIN_NEAR_HOME_RADIUS_M: Final = 1_000
@@ -50,35 +42,25 @@ MAX_NEAR_HOME_FADE_AFTER_MIN: Final = 720
 NEAR_HOME_FADE_MIN: Final = 60
 """After the fade starts, near home falls to 0 over this many minutes."""
 
+# Group entries: options
+CONF_MEMBERS: Final = "members"
+
 DEFAULT_ZONE: Final = "zone.home"
 DEFAULT_GROUP_NAME: Final = "Home ETA"
 
 TICK_INTERVAL: Final = timedelta(seconds=60)
-STORE_VERSION: Final = 1
 FIX_LOG_SIZE: Final = 20
 DIAGNOSTICS_COORDINATE_DECIMALS: Final = 2
 
 SIGNAL_PERSON_UPDATED: Final = f"{DOMAIN}_person_updated_{{zone}}"
 """Dispatcher signal, formatted with the zone entity id."""
 
-SERVICE_RESET_HISTORY: Final = "reset_history"
-SERVICE_EXPORT_HISTORY: Final = "export_history"
-ATTR_PERSON: Final = "person"
-
 # Entity keys (also translation keys and unique-id suffixes)
-KEY_ETA_KINEMATIC: Final = "eta_kinematic"
-KEY_ETA_HISTORICAL: Final = "eta_historical"
-KEY_MINUTES: Final = "minutes_to_home"
-KEY_DISTANCE: Final = "distance_to_home"
-KEY_CLOSING_SPEED: Final = "closing_speed"
-KEY_APPROACH_STATE: Final = "approach_state"
-KEY_CONFIDENCE: Final = "eta_confidence"
+KEY_HEADING_HOME: Final = "heading_home"
 KEY_ARRIVING_SOON: Final = "arriving_soon"
 KEY_THRESHOLD: Final = "arriving_soon_threshold"
-KEY_FIRST_ARRIVAL: Final = "first_arrival"
-KEY_FIRST_PERSON: Final = "first_arrival_person"
-KEY_FIRST_MINUTES: Final = "first_arrival_minutes"
-KEY_SOMEONE_SOON: Final = "someone_arriving_soon"
-KEY_HEADING_HOME: Final = "heading_home"
 KEY_EXPECTED_HOME: Final = "expected_home"
+KEY_MINUTES: Final = "minutes_to_home"
+KEY_DISTANCE: Final = "distance_to_home"
 KEY_NEAR_HOME: Final = "near_home"
+KEY_SOMEONE_SOON: Final = "someone_arriving_soon"

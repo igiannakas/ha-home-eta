@@ -3,13 +3,12 @@
     "abort": {
       "already_configured": "This person is already tracked to this zone.",
       "group_exists": "A group with this name already exists for this zone.",
-      "no_people": "Add at least one person before adding a first-arrival group."
+      "no_people": "Add at least one person before adding a group."
     },
     "error": {
       "member_not_tracked": "Every member must be added as a person tracked to this zone.",
       "no_members": "Pick at least one person.",
       "person_invalid": "This person entity does not exist.",
-      "target_ignored": "The destination zone cannot also be ignored.",
       "zone_invalid": "This zone does not exist or has no location."
     },
     "step": {
@@ -17,43 +16,35 @@
         "data": {
           "members": "People",
           "name": "Name",
-          "zone": "Destination zone",
-          "near_home_fade_after_min": "Near home fades after",
-          "near_home_radius_m": "Near-home radius"
+          "zone": "Destination zone"
         },
         "data_description": {
           "members": "People already added to Home ETA for this zone.",
           "name": "Used for the device and its entity IDs.",
-          "zone": "Must match the zone the people are tracked to.",
-          "near_home_fade_after_min": "After someone has stayed at one place this long, Near home fades to 0 % over an hour, so an afternoon at a friend's nearby does not keep the house warm throughout. 0 never fades.",
-          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way people are going."
+          "zone": "Must match the zone the people are tracked to."
         },
-        "description": "Shows who is due first, whether anyone is arriving soon, when the first person heading home is expected, and how near home the nearest person is.",
-        "title": "Add a first-arrival group"
+        "description": "Combines several people: when the first of them heading home is expected, whether anyone is arriving soon, and how near home the nearest is.",
+        "title": "Add a group"
       },
       "person": {
         "data": {
-          "activity_entity": "Activity sensor",
-          "enable_historical": "Learn arrival times from past trips",
-          "ignored_zones": "Zones that end a trip",
+          "near_home_fade_after_min": "Near home fades after",
+          "near_home_radius_m": "Near-home radius",
           "person": "Person",
-          "reference_eta_entity": "Reference travel-time sensor",
           "zone": "Destination zone"
         },
         "data_description": {
-          "activity_entity": "Optional. The Companion app activity sensor, shown as an attribute only.",
-          "enable_historical": "Adds a second ETA sensor based on how long past trips took from the same distance. Turning it off deletes the learned trips.",
-          "ignored_zones": "Optional. Time spent here (for example at work) is never learned as travel time.",
+          "near_home_fade_after_min": "After the person has stayed at one place this long, Near home fades to 0 % over an hour, so an afternoon at a friend's nearby does not keep the house warm throughout. 0 never fades.",
+          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way the person is going.",
           "person": "Uses the person's phone location.",
-          "reference_eta_entity": "Optional. A Waze, Google or HERE travel-time sensor, shown as an attribute for comparison.",
           "zone": "Usually Home."
         },
-        "description": "Track when one person will arrive.",
+        "description": "Say when one person is heading home, when they will get there and how near they are.",
         "title": "Add a person"
       },
       "user": {
         "menu_options": {
-          "group": "First-arrival group",
+          "group": "Group",
           "person": "Person"
         },
         "title": "What do you want to add?"
@@ -73,14 +64,8 @@
       "heading_home": {
         "name": "Heading home",
         "state_attributes": {
-          "expected_at": {
-            "name": "Expected home"
-          },
           "farthest_m": {
             "name": "Farthest since last stay"
-          },
-          "minutes": {
-            "name": "Minutes to home"
           },
           "reason": {
             "name": "Reason",
@@ -110,9 +95,6 @@
               "typical": "Typical for the distance",
               "zone_crossings": "Between zones around home"
             }
-          },
-          "staying_since": {
-            "name": "Staying since"
           }
         }
       },
@@ -134,152 +116,15 @@
       }
     },
     "sensor": {
-      "approach_state": {
-        "name": "Approach",
-        "state": {
-          "approaching": "Approaching",
-          "arriving_soon": "Arriving soon",
-          "away": "Away",
-          "home": "Home",
-          "stationary": "Stationary"
-        },
-        "state_attributes": {
-          "activity": {
-            "name": "Activity"
-          },
-          "direction": {
-            "name": "Direction",
-            "state": {
-              "away_from": "Away from",
-              "stationary": "Stationary",
-              "towards": "Towards",
-              "unknown": "Unknown"
-            }
-          },
-          "reason": {
-            "name": "Reason",
-            "state": {
-              "arrived": "Arrived",
-              "close_by": "Close by",
-              "closing": "Closing in",
-              "eta_within_threshold": "Within threshold",
-              "in_other_zone": "In another zone",
-              "initial": "Started",
-              "left": "Left",
-              "moving_again": "Moving again",
-              "no_movement": "No movement",
-              "no_reports": "No reports",
-              "not_closing": "Not closing in",
-              "restored": "Restored"
-            }
-          },
-          "since": {
-            "name": "Since"
-          },
-          "stale": {
-            "name": "Stale"
-          },
-          "trip_started_at": {
-            "name": "Trip started"
-          },
-          "zones": {
-            "name": "Other zones"
-          }
-        }
-      },
-      "closing_speed": {
-        "name": "Closing speed"
-      },
       "distance_to_home": {
         "name": "Distance to home"
-      },
-      "eta_confidence": {
-        "name": "ETA confidence",
-        "state": {
-          "high": "High",
-          "low": "Low",
-          "medium": "Medium"
-        }
-      },
-      "eta_historical": {
-        "name": "ETA (historical)",
-        "state_attributes": {
-          "eta_high": {
-            "name": "Latest"
-          },
-          "eta_low": {
-            "name": "Earliest"
-          },
-          "last_trip_at": {
-            "name": "Last trip learned"
-          },
-          "method": {
-            "name": "Method"
-          },
-          "trips": {
-            "name": "Trips used"
-          },
-          "trips_learned": {
-            "name": "Trips learned"
-          }
-        }
-      },
-      "eta_kinematic": {
-        "name": "ETA (kinematic)",
-        "state_attributes": {
-          "activity": {
-            "name": "Activity"
-          },
-          "closing_speed_mps": {
-            "name": "Closing speed"
-          },
-          "confidence": {
-            "name": "Confidence"
-          },
-          "distance_m": {
-            "name": "Distance"
-          },
-          "eta_high": {
-            "name": "Latest"
-          },
-          "eta_low": {
-            "name": "Earliest"
-          },
-          "last_eta": {
-            "name": "Last ETA"
-          },
-          "last_fix_at": {
-            "name": "Last fix"
-          },
-          "method": {
-            "name": "Method"
-          },
-          "reference_eta": {
-            "name": "Reference ETA"
-          },
-          "reference_eta_unit": {
-            "name": "Reference ETA unit"
-          },
-          "samples": {
-            "name": "Samples"
-          },
-          "stale": {
-            "name": "Stale"
-          }
-        }
       },
       "expected_home": {
         "name": "Expected home",
         "state_attributes": {
-          "distance_m": {
-            "name": "Distance"
-          },
           "heading_home": {
             "name": "Heading home"
           },
-          "minutes": {
-            "name": "Minutes"
-          },
           "missing_members": {
             "name": "Missing members"
           },
@@ -291,63 +136,6 @@
           },
           "persons_home": {
             "name": "Home"
-          },
-          "reason": {
-            "name": "Reason",
-            "state": {
-              "arrived": "Arrived",
-              "at_place": "Staying somewhere",
-              "initial": "No trip home yet",
-              "moving_away": "Moving away",
-              "overdue": "Overdue",
-              "progress": "Getting closer",
-              "restored": "Restored",
-              "zone_changed": "Zone changed",
-              "zone_crossing": "Entered a zone around home"
-            }
-          },
-          "speed_source": {
-            "name": "Speed from",
-            "state": {
-              "measured": "Measured",
-              "on_foot": "On foot",
-              "typical": "Typical for the distance",
-              "zone_crossings": "Between zones around home"
-            }
-          }
-        }
-      },
-      "first_arrival": {
-        "name": "First arrival",
-        "state_attributes": {
-          "candidates": {
-            "name": "On the way"
-          },
-          "confidence": {
-            "name": "Confidence"
-          },
-          "missing_members": {
-            "name": "Missing members"
-          },
-          "person": {
-            "name": "Person"
-          },
-          "person_name": {
-            "name": "Person name"
-          },
-          "persons_home": {
-            "name": "Home"
-          }
-        }
-      },
-      "first_arrival_minutes": {
-        "name": "First arrival minutes"
-      },
-      "first_arrival_person": {
-        "name": "First arrival person",
-        "state_attributes": {
-          "person_entity_id": {
-            "name": "Person entity"
           }
         }
       },
@@ -357,9 +145,6 @@
       "near_home": {
         "name": "Near home",
         "state_attributes": {
-          "distance_m": {
-            "name": "Distance"
-          },
           "fade_after_min": {
             "name": "Fades after"
           },
@@ -383,14 +168,8 @@
     }
   },
   "exceptions": {
-    "history_disabled": {
-      "message": "Learning from past trips is off for every person this targets."
-    },
     "invalid_options": {
-      "message": "Invalid advanced options: {error}"
-    },
-    "no_matching_person": {
-      "message": "No loaded Home ETA person matches {persons}."
+      "message": "Invalid options: {error}"
     },
     "zone_not_ready": {
       "message": "Zone {zone} is not available yet."
@@ -398,89 +177,56 @@
   },
   "issues": {
     "group_no_members": {
-      "description": "Everyone in the first-arrival group \"{entry}\" has been removed from Home ETA, so its sensors stay unknown. Add people to the group in its options, or remove the group.",
-      "title": "First-arrival group has no members"
+      "description": "Everyone in the group \"{entry}\" has been removed from Home ETA, so its sensors stay unknown. Add people to the group in its options, or remove the group.",
+      "title": "Group has no members"
     },
     "person_missing": {
       "description": "Home ETA entry \"{entry}\" tracks {person}, which no longer exists. Restore the person or remove the entry.",
       "title": "Tracked person is missing"
     },
     "zone_missing": {
-      "description": "Home ETA entry \"{entry}\" targets {zone}, which no longer exists or has no location. Re-create the zone with the same entity ID, or remove the entry. Until Home Assistant restarts, ETAs use the zone's last known position; after that the entry waits for the zone.",
+      "description": "Home ETA entry \"{entry}\" targets {zone}, which no longer exists or has no location. Re-create the zone with the same entity ID, or remove the entry. Until Home Assistant restarts, distances use the zone's last known position; after that the entry waits for the zone.",
       "title": "Destination zone is missing"
     }
   },
   "options": {
     "abort": {},
     "error": {
+      "invalid_advanced": "These advanced values do not work together: {error}",
       "member_not_tracked": "Every member must be added as a person tracked to this zone.",
-      "no_members": "Pick at least one person.",
-      "target_ignored": "The destination zone cannot also be ignored.",
-      "invalid_advanced": "These advanced values do not work together: {error}"
+      "no_members": "Pick at least one person."
     },
     "step": {
       "init": {
         "data": {
-          "activity_entity": "Activity sensor",
-          "enable_historical": "Learn arrival times from past trips",
-          "ignored_zones": "Zones that end a trip",
           "members": "People",
-          "reference_eta_entity": "Reference travel-time sensor",
           "near_home_fade_after_min": "Near home fades after",
           "near_home_radius_m": "Near-home radius"
         },
         "data_description": {
-          "activity_entity": "Optional. The Companion app activity sensor, shown as an attribute only.",
-          "enable_historical": "Adds a second ETA sensor based on how long past trips took from the same distance. Turning it off deletes the learned trips.",
-          "ignored_zones": "Optional. Time spent here (for example at work) is never learned as travel time.",
           "members": "People tracked to this group's zone.",
-          "reference_eta_entity": "Optional. A Waze, Google or HERE travel-time sensor, shown as an attribute for comparison.",
-          "near_home_fade_after_min": "After someone has stayed at one place this long, Near home fades to 0 % over an hour, so an afternoon at a friend's nearby does not keep the house warm throughout. 0 never fades.",
-          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way people are going."
+          "near_home_fade_after_min": "After the person has stayed at one place this long, Near home fades to 0 % over an hour, so an afternoon at a friend's nearby does not keep the house warm throughout. 0 never fades.",
+          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way the person is going."
         },
         "sections": {
           "advanced": {
             "data": {
               "arriving_soon_distance_m": "Arriving-soon distance",
               "max_gps_accuracy_m": "Worst usable GPS accuracy",
-              "min_closing_speed_mps": "Slowest closing speed",
               "speed_filter_tau_s": "Speed smoothing",
-              "stale_after_s": "Stale after"
+              "stale_after_s": "Speed stale after"
             },
             "data_description": {
-              "arriving_soon_distance_m": "Within this distance of the zone centre, someone heading home counts as arriving soon.",
+              "arriving_soon_distance_m": "Within this distance of the zone centre, someone heading home is arriving soon whatever the expected time.",
               "max_gps_accuracy_m": "Position reports less accurate than this are ignored.",
-              "min_closing_speed_mps": "Below this speed towards the zone there is no ETA.",
               "speed_filter_tau_s": "Higher is smoother but slower to react.",
-              "stale_after_s": "With no position report for this long the ETA is cleared and the person counts as stationary. Raise it for someone who walks slower than about 2 km/h with an iPhone, which reports only every 500 m."
+              "stale_after_s": "With no position report for this long, the measured speed is no longer used. Raise it for someone who walks slower than about 2 km/h with an iPhone, which reports only every 500 m."
             },
             "name": "Advanced"
           }
         },
         "title": "Home ETA options"
       }
-    }
-  },
-  "services": {
-    "export_history": {
-      "description": "Returns the learned trip history for inspection.",
-      "fields": {
-        "person": {
-          "description": "Limit to these people. Leave empty for everyone.",
-          "name": "People"
-        }
-      },
-      "name": "Export learned history"
-    },
-    "reset_history": {
-      "description": "Forgets the learned trip history behind the historical ETA.",
-      "fields": {
-        "person": {
-          "description": "Limit to these people. Leave empty for everyone.",
-          "name": "People"
-        }
-      },
-      "name": "Reset learned history"
     }
   }
 }
