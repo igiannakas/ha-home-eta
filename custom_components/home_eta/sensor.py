@@ -48,7 +48,8 @@ from .const import (
     KEY_NEAR_HOME,
 )
 from .core.approach import ApproachState
-from .core.homeward import HomewardRestore
+from .core.geo import is_valid_coordinate
+from .core.homeward import HomewardRestore, HomewardStay, HomewardTrip
 from .core.kinematic import Confidence
 from .entity import GroupEntity, PersonEntity
 from .runtime import GroupRuntime, GroupView, PersonRuntime, PersonView
@@ -84,17 +85,44 @@ def _number(value: object) -> float | None:
 
 
 def _homeward_restore(value: object) -> HomewardRestore | None:
-    """Return a saved trip home, if the saved data is usable."""
+    """Return a saved trip home and stay, if the saved data is usable.
+
+    The trip is stored flat (``since``, ``farthest_m``, ``closest_m``), as
+    1.1.0 saved it, beside ``last_heard`` and a ``stay``.
+    """
     if not isinstance(value, dict):
         return None
+    trip: HomewardTrip | None = None
     since = _number(value.get("since"))
     farthest = _number(value.get("farthest_m"))
     closest = _number(value.get("closest_m"))
-    if since is None or farthest is None or closest is None:
+    if (
+        since is not None
+        and farthest is not None
+        and closest is not None
+        and farthest >= 0
+        and closest >= 0
+    ):
+        trip = HomewardTrip(since, farthest, closest)
+    stay: HomewardStay | None = None
+    saved_stay = value.get("stay")
+    if isinstance(saved_stay, dict):
+        stay_since = _number(saved_stay.get("since"))
+        latitude = _number(saved_stay.get("latitude"))
+        longitude = _number(saved_stay.get("longitude"))
+        distance = _number(saved_stay.get("distance_m"))
+        if (
+            stay_since is not None
+            and latitude is not None
+            and longitude is not None
+            and distance is not None
+            and is_valid_coordinate(latitude, longitude)
+            and distance >= 0
+        ):
+            stay = HomewardStay(stay_since, latitude, longitude, distance)
+    if trip is None and stay is None:
         return None
-    if farthest < 0 or closest < 0:
-        return None
-    return HomewardRestore(since, farthest, closest)
+    return HomewardRestore(_number(value.get("last_heard")), trip, stay)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -331,7 +359,12 @@ class ApproachStateSensor(PersonEntity, SensorEntity, RestoreEntity):
             return
         data = extra.as_dict()
         state = data.get("state")
+        homeward = _homeward_restore(data.get("homeward"))
         since, heard = _number(data.get("since")), _number(data.get("last_heard"))
+        if heard is None and homeward is not None:
+            # Restored after a restart and not heard from since: the trip's
+            # own record of the last report.
+            heard = homeward.last_heard
         if heard is None:
             return
         approach = (
@@ -339,7 +372,6 @@ class ApproachStateSensor(PersonEntity, SensorEntity, RestoreEntity):
             if isinstance(state, str) and state in {s.value for s in RESTORABLE_STATES}
             else None
         )
-        homeward = _homeward_restore(data.get("homeward"))
         if approach is None and homeward is None:
             return
         self._runtime.restore_state(
@@ -351,18 +383,28 @@ class ApproachStateSensor(PersonEntity, SensorEntity, RestoreEntity):
         """Save the state, when it began, the trip home and the last report."""
         snap = self._runtime.view.snapshot
         homeward = self._runtime.tracker.homeward.restore_data()
+        saved: dict[str, Any] | None = None
+        if homeward is not None:
+            saved = {"last_heard": homeward.last_heard}
+            if (trip := homeward.trip) is not None:
+                saved.update(
+                    since=trip.since,
+                    farthest_m=trip.farthest_m,
+                    closest_m=trip.closest_m,
+                )
+            if (stay := homeward.stay) is not None:
+                saved["stay"] = {
+                    "since": stay.since,
+                    "latitude": stay.latitude,
+                    "longitude": stay.longitude,
+                    "distance_m": stay.distance_m,
+                }
         return RestoredExtraData(
             {
                 "state": None if snap is None else snap.state.value,
                 "since": None if snap is None else snap.state_since,
                 "last_heard": None if snap is None else snap.last_heard,
-                "homeward": None
-                if homeward is None
-                else {
-                    "since": homeward.since,
-                    "farthest_m": homeward.farthest_m,
-                    "closest_m": homeward.closest_m,
-                },
+                "homeward": saved,
             }
         )
 
@@ -465,7 +507,7 @@ class ExpectedHomeSensor(GroupEntity, SensorEntity):
     """
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
-    _unrecorded_attributes = frozenset({"minutes", "heading_home"})
+    _unrecorded_attributes = frozenset({"minutes", "heading_home", "distance_m"})
 
     def __init__(self, runtime: GroupRuntime) -> None:
         """Initialise."""

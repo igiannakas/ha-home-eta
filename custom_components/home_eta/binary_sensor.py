@@ -61,7 +61,9 @@ class HeadingHomeSensor(PersonEntity, BinarySensorEntity):
     stays on until the person gets home or the trip clearly is not one.
     """
 
-    _unrecorded_attributes = frozenset({"expected_at", "minutes", "speed_mps"})
+    _unrecorded_attributes = frozenset(
+        {"expected_at", "minutes", "speed_mps", "farthest_m"}
+    )
 
     def __init__(self, runtime: PersonRuntime) -> None:
         """Initialise."""

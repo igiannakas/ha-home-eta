@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import logging
 from typing import TYPE_CHECKING, Any
@@ -417,13 +417,14 @@ class PersonRuntime:
         last_heard: float,
         homeward: HomewardRestore | None = None,
     ) -> None:
-        """Restore the approach state and trip home saved before a restart.
+        """Restore the approach state, trip home and stay saved before a restart.
 
         The approach state only when the person was heard from within the
         stale period: the silence before the restart counts, so a restored
         state can never outlive it, however often Home Assistant restarts or
         reloads. A trip home within the longest ETA; the overdue rule then
-        ends it at once if it should have finished by now.
+        ends it at once if it should have finished by now. A stay whenever:
+        the next fix elsewhere ends it.
         """
         params = self.config.params
         now = dt_util.utcnow().timestamp()
@@ -438,12 +439,15 @@ class PersonRuntime:
         ):
             _LOGGER.debug("%s: restored approach state %s", self.person_id, state)
             changed = True
+        if homeward is not None and age > params.max_eta_s:
+            # Longer ago than any trip home could take; a stay may still hold.
+            homeward = replace(homeward, trip=None)
         if (
             homeward is not None
-            and age <= params.max_eta_s
+            and (homeward.trip is not None or homeward.stay is not None)
             and self.tracker.restore_homeward(homeward, last_heard, now)
         ):
-            _LOGGER.debug("%s: restored the trip home", self.person_id)
+            _LOGGER.debug("%s: restored the trip home or stay", self.person_id)
             changed = True
         if changed:
             self._refresh()

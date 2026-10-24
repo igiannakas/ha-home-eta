@@ -5,6 +5,10 @@
         "default": "mdi:home-outline",
         "state": { "on": "mdi:home-import-outline" }
       },
+      "heading_home": {
+        "default": "mdi:home-outline",
+        "state": { "on": "mdi:home-import-outline" }
+      },
       "someone_arriving_soon": {
         "default": "mdi:home-outline",
         "state": { "on": "mdi:home-account" }
@@ -29,10 +33,12 @@
       "eta_confidence": { "default": "mdi:gauge" },
       "eta_historical": { "default": "mdi:history" },
       "eta_kinematic": { "default": "mdi:home-clock" },
+      "expected_home": { "default": "mdi:home-clock-outline" },
       "first_arrival": { "default": "mdi:home-clock" },
       "first_arrival_minutes": { "default": "mdi:timer-sand" },
       "first_arrival_person": { "default": "mdi:account-arrow-right" },
-      "minutes_to_home": { "default": "mdi:timer-sand" }
+      "minutes_to_home": { "default": "mdi:timer-sand" },
+      "near_home": { "default": "mdi:home-map-marker" }
     }
   },
   "services": {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
@@ -26,6 +27,7 @@ from custom_components.home_eta.const import (
     ENTRY_TYPE_GROUP,
 )
 from tests.helpers import ALEX, SAM, group_entry, person_entry, set_person, step
+from tests.sim import to_latlon
 
 HEADING = "binary_sensor.alex_heading_home"
 APPROACH = "sensor.alex_approach"
@@ -355,12 +357,122 @@ async def test_trip_home_saved_for_a_restart(
     await setup_entries(hass, entry)
     await drive(hass, freezer, ALEX, [9_200.0, 8_400.0, 7_600.0])
     assert hass.states.get(HEADING).state == STATE_ON
-    sensor = next(
+    saved = approach_sensor(hass).extra_restore_state_data.as_dict()
+    assert saved["homeward"]["farthest_m"] == pytest.approx(10_000, abs=50)
+    assert saved["homeward"]["closest_m"] == pytest.approx(7_600, abs=50)
+    assert saved["homeward"]["since"] is not None
+
+
+def approach_sensor(hass: HomeAssistant) -> Any:
+    """Return Alex's approach sensor entity."""
+    return next(
         e
         for e in hass.data["sensor"].entities
         if e.entity_id == APPROACH  # type: ignore[attr-defined]
     )
-    saved = sensor.extra_restore_state_data.as_dict()
-    assert saved["homeward"]["farthest_m"] == pytest.approx(10_000, abs=50)
-    assert saved["homeward"]["closest_m"] == pytest.approx(7_600, abs=50)
-    assert saved["homeward"]["since"] is not None
+
+
+async def test_a_stay_survives_a_restart(hass: HomeAssistant) -> None:
+    """Three hours at a friend's 500 m away: near home stays faded."""
+    now = dt_util.utcnow().timestamp()
+    lat, lon = to_latlon(500, 0)
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(APPROACH, "stationary"),
+                {
+                    "state": "stationary",
+                    "since": now - 10_000,
+                    "last_heard": now - 600,
+                    "homeward": {
+                        "last_heard": now - 600,
+                        "stay": {
+                            "since": now - 3 * 3_600,
+                            "latitude": lat,
+                            "longitude": lon,
+                            "distance_m": 500.0,
+                        },
+                    },
+                },
+            )
+        ],
+    )
+    hass.set_state(CoreState.starting)
+    set_person(hass, ALEX, 500)
+    await setup_entries(hass, person_entry(ALEX), group_entry([ALEX]))
+    near = hass.states.get(NEAR)
+    assert near.state == "0"
+    assert dt_util.parse_datetime(near.attributes["staying_since"]) == (
+        dt_util.utc_from_timestamp(now - 3 * 3_600)
+    )
+    # Saved again for the next restart.
+    saved = approach_sensor(hass).extra_restore_state_data.as_dict()["homeward"]
+    assert saved["stay"]["since"] == now - 3 * 3_600
+    assert saved["last_heard"] == now - 600
+
+
+async def test_a_restored_trip_survives_a_second_restart(hass: HomeAssistant) -> None:
+    """Restored, then restarted again before any fix: the trip is kept."""
+    now = dt_util.utcnow().timestamp()
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(APPROACH, "away"),
+                {
+                    # What a restart right after a restore saves: no approach
+                    # state of its own, the trip's own record of the last report.
+                    "state": "away",
+                    "since": None,
+                    "last_heard": None,
+                    "homeward": {
+                        "last_heard": now - 120,
+                        "since": now - 600,
+                        "farthest_m": 30_000,
+                        "closest_m": 20_000,
+                    },
+                },
+            )
+        ],
+    )
+    hass.set_state(CoreState.starting)
+    set_person(hass, ALEX, 21_000)
+    await setup_entries(hass, person_entry(ALEX))
+    state = hass.states.get(HEADING)
+    assert state.state == STATE_ON
+    assert state.attributes["reason"] == "restored"
+    saved = approach_sensor(hass).extra_restore_state_data.as_dict()["homeward"]
+    assert saved["last_heard"] == now - 120
+    assert saved["since"] == now - 600
+
+
+async def test_a_saved_stay_with_bad_coordinates_is_ignored(
+    hass: HomeAssistant,
+) -> None:
+    now = dt_util.utcnow().timestamp()
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(APPROACH, "stationary"),
+                {
+                    "state": "stationary",
+                    "since": now - 10_000,
+                    "last_heard": now - 600,
+                    "homeward": {
+                        "stay": {
+                            "since": now - 3 * 3_600,
+                            "latitude": 123.0,
+                            "longitude": 0.0,
+                            "distance_m": 500.0,
+                        }
+                    },
+                },
+            )
+        ],
+    )
+    hass.set_state(CoreState.starting)
+    set_person(hass, ALEX, 500)
+    await setup_entries(hass, person_entry(ALEX), group_entry([ALEX]))
+    assert hass.states.get(NEAR).state == "100"

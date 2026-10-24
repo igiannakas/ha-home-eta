@@ -14,7 +14,7 @@ import math
 
 import pytest
 
-from custom_components.home_eta.core.homeward import HomewardReason
+from custom_components.home_eta.core.homeward import HomewardReason, HomewardSnapshot
 from custom_components.home_eta.core.kinematic import Target
 from custom_components.home_eta.core.params import EstimatorParams
 from custom_components.home_eta.core.tracker import (
@@ -300,3 +300,129 @@ def test_a_glitch_into_a_zone_is_undone() -> None:
     homeward = trk.snapshot(t).homeward
     assert homeward is not None
     assert not homeward.heading
+
+
+# -- regressions found in review -------------------------------------------------
+
+
+class Phone:
+    """Reports to a person tracker along a line (or circle) around home."""
+
+    def __init__(self, params: EstimatorParams | None = None, *, rings: bool = False):
+        self.trk = PersonTracker(
+            TrackerConfig(params or EstimatorParams()), TARGET, at_target=True
+        )
+        if rings:
+            self.trk.set_rings(RINGS)
+        self.t = T0
+        self.report(TARGET.radius_m + 50.0)
+
+    def report(self, east: float, north: float = 0.0, accuracy: float = 15.0) -> None:
+        lat, lon = to_latlon(east, north)
+        self.trk.update(PersonReport(self.t, False, (), lat, lon, accuracy))
+
+    def after(self, seconds: float, east: float, **kwargs: float) -> None:
+        self.t += seconds
+        self.report(east, **kwargs)
+
+    def tick(self, seconds: float = TICK_S) -> None:
+        self.t += seconds
+        self.trk.tick(self.t)
+
+    @property
+    def homeward(self) -> HomewardSnapshot:
+        snap = self.trk.snapshot(self.t).homeward
+        assert snap is not None
+        return snap
+
+    def out_and_home_to(self, stop_m: float) -> None:
+        """Drive out to 10 km, stay an hour, drive back towards ``stop_m``."""
+        for east in range(1_000, 10_001, 1_000):
+            self.after(90.0, float(east))
+        for _ in range(5):
+            self.after(900.0, 10_000.0)
+        for east in range(9_000, int(stop_m) - 1, -1_000):
+            self.after(90.0, float(east))
+        assert self.homeward.heading
+
+
+def test_a_stay_with_bouncing_indoor_fixes_ends_the_trip_home() -> None:
+    """Wi-Fi fixes indoors jumping 200 m at 65 m accuracy are still a stay."""
+    phone = Phone()
+    phone.out_and_home_to(5_000)
+    for i in range(36):  # three hours at a friend's, a fix every 5 minutes
+        phone.after(300.0, 5_000.0, north=200.0 if i % 2 else 0.0, accuracy=65.0)
+        phone.trk.tick(phone.t)
+    homeward = phone.homeward
+    assert not homeward.heading
+    assert homeward.reason is HomewardReason.AT_PLACE
+    assert homeward.still_since is not None
+    assert phone.t - homeward.still_since > 2 * 3_600
+
+
+@pytest.mark.parametrize("stale_after_s", [900.0, 3_600.0, 7_200.0])
+def test_a_quiet_phone_does_not_flap_whatever_the_stale_time(
+    stale_after_s: float,
+) -> None:
+    """Overdue ends the trip once; a speed still "fresh" cannot restart it."""
+    phone = Phone(EstimatorParams(stale_after_s=stale_after_s))
+    phone.out_and_home_to(4_000)
+    changes = 0
+    before = phone.homeward.heading
+    for _ in range(int(stale_after_s // 60) + 30):
+        phone.tick()
+        if phone.homeward.heading != before:
+            changes += 1
+            before = phone.homeward.heading
+    assert changes == 1
+    assert phone.homeward.reason is HomewardReason.OVERDUE
+
+
+def test_a_glitch_undone_by_a_merged_fix_is_undone_in_heading_home() -> None:
+    """A jump into a zone and back within seconds (merged) starts nothing."""
+    phone = Phone(rings=True)
+    for east in (4_400.0, 4_410.0, 4_390.0):
+        phone.after(600.0, east, accuracy=20.0)
+    phone.after(10.0, 3_700.0, accuracy=20.0)  # into the 4 km zone
+    assert phone.homeward.heading
+    phone.after(5.0, 4_400.0, accuracy=20.0)  # back, merged with the last good fix
+    assert not phone.homeward.heading
+
+
+def test_a_clock_step_back_does_not_stretch_a_quiet_trip_home() -> None:
+    def minutes_until_overdue(step_back_s: float) -> float:
+        phone = Phone()
+        phone.out_and_home_to(4_000)
+        last = phone.t
+        phone.t -= step_back_s  # the clock steps back
+        for minute in range(1, 600):
+            phone.tick()
+            if not phone.homeward.heading:
+                assert phone.homeward.reason is HomewardReason.OVERDUE
+                return minute
+        raise AssertionError(last)
+
+    # The minute that passed across the step cannot be known.
+    assert abs(minutes_until_overdue(7_200.0) - minutes_until_overdue(0.0)) <= 1
+
+
+def test_a_road_along_a_zone_edge_is_not_a_trip_home() -> None:
+    """45 minutes on an orbital road weaving 400 m either side of the 8 km zone."""
+    phone = Phone(rings=True)
+    for r in range(1_000, 8_501, 1_000):
+        phone.after(90.0, float(r))
+    heading = starts = 0
+    before = False
+    theta = 0.0
+    for i in range(23):
+        theta += 1_440.0 / 8_000.0
+        r = 8_000.0 + 400.0 * math.sin(i * 0.9)
+        phone.after(120.0, r * math.cos(theta), north=r * math.sin(theta))
+        now = phone.homeward.heading
+        heading += now
+        starts += now and not before
+        before = now
+    # The first entry is indistinguishable from a trip home; leaving the zone
+    # ends it, and the zone cannot start another on this outing.
+    assert starts == 1
+    assert heading <= 3

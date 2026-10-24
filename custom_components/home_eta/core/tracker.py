@@ -271,9 +271,9 @@ class PersonTracker:
     def restore_homeward(
         self, data: HomewardRestore, last_heard: float, now: float
     ) -> bool:
-        """Resume a trip home saved before a restart.
+        """Resume a stay and a trip home saved before a restart or reload.
 
-        It ends like any other: the first fixes, a stay or the overdue rule,
+        They end like any other: the first fixes, a stay or the overdue rule,
         which is applied at once.
         """
         if not self._homeward.restore(data, last_heard, self._distance_m):
@@ -368,6 +368,7 @@ class PersonTracker:
 
         if outcome is not None and outcome.rolled_back:
             transition = _chain(transition, self._undo_glitch(t))
+            self._undo_homeward_glitch()
         if outcome is not None and outcome.accepted:
             self._feed_homeward(t, position, accuracy, outcome)
             self._fixes_in_trip += 1
@@ -407,9 +408,8 @@ class PersonTracker:
     ) -> None:
         """Give an accepted fix to the heading-home tracker."""
         homeward = self._homeward
-        if outcome.rolled_back and self._homeward_before_move is not None:
-            # The previous fix jumped away and this one is back: undo it here too.
-            homeward.load(self._homeward_before_move)
+        # Kept, like the approach state, until the next fix shows the move was
+        # real; only a moving fix can turn out to be a glitch.
         self._homeward_before_move = (
             homeward.save() if outcome.verdict is FixVerdict.MOVED else None
         )
@@ -419,7 +419,18 @@ class PersonTracker:
             Fix(position[0], position[1], accuracy, t),
             outcome.distance_m,
             speed_mps=self._fresh_speed(t),
+            still=outcome.verdict is FixVerdict.STATIONARY,
         )
+
+    def _undo_homeward_glitch(self) -> None:
+        """Undo the last moving fix in heading home too (it was a glitch).
+
+        Whatever the fix that showed it (accepted, merged or rejected as a
+        jump): the kinematic estimator has already put its state back.
+        """
+        saved, self._homeward_before_move = self._homeward_before_move, None
+        if saved is not None:
+            self._homeward.load(saved)
 
     def _fresh_speed(self, now: float) -> float | None:
         """Return the filtered closing speed, unless stopped or stale."""

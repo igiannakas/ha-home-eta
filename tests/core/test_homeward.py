@@ -11,7 +11,9 @@ from custom_components.home_eta.core.homeward import (
     TYPICAL_SPEED_MPS,
     HomewardReason,
     HomewardRestore,
+    HomewardStay,
     HomewardTracker,
+    HomewardTrip,
     NearHomeConfig,
     SpeedSource,
     near_home,
@@ -199,11 +201,15 @@ def test_entering_a_zone_around_home_starts_the_trip_home_at_once() -> None:
 
 
 def test_a_new_zone_is_not_a_crossing() -> None:
+    """A zone added between two fixes has no "before": entering it is unknown."""
     tracker, phone = out_of_home()
-    phone.at(6_000)
-    tracker.set_rings([ring(8_000)])  # added while the person is inside it
-    phone.at(5_900)
+    phone.at(9_000)
+    tracker.set_rings([ring(8_000)])  # added while the person is outside it
+    phone.at(7_000)
     assert not tracker.heading
+    phone.at(9_000)
+    phone.at(7_000)  # now a crossing
+    assert tracker.heading
 
 
 def test_staying_somewhere_ends_and_prevents_the_trip_home() -> None:
@@ -318,14 +324,51 @@ def test_ring_to_ring_speed_drives_the_estimate() -> None:
 
 
 def test_ring_speed_needs_real_progress_between_crossings() -> None:
+    """Two zones 300 m apart give no speed worth trusting."""
+    tracker, phone = out_of_home()
+    tracker.set_rings([ring(8_000), ring(8_300)])
+    phone.at(8_500)
+    phone.at(8_200)  # into the 8.3 km zone: heading home
+    phone.at(7_900)  # into the 8 km zone, 300 m on
+    snap = tracker.snapshot(phone.t)
+    assert snap.heading
+    assert snap.speed_source is SpeedSource.TYPICAL
+
+
+def test_a_road_along_a_zone_edge_does_not_keep_starting_trips() -> None:
+    """Weaving in and out of the 8 km zone: one short start, then nothing."""
     tracker, phone = out_of_home()
     tracker.set_rings([ring(8_000)])
-    phone.at(8_100)
-    phone.at(7_900)  # in
-    phone.at(8_100)  # out
-    phone.at(7_950)  # in again, no progress between the two
-    snap = tracker.snapshot(phone.t)
-    assert snap.speed_source is SpeedSource.TYPICAL
+    phone.at(8_500)
+    phone.at(7_700, after_s=2 * MIN)  # in: a trip home, as far as anyone knows
+    assert tracker.heading
+    phone.at(8_300, after_s=2 * MIN)  # out of the zone that started it
+    assert not tracker.heading
+    assert tracker.reason is HomewardReason.MOVING_AWAY
+    for east in (7_700, 8_300, 7_700, 8_300, 7_700):
+        phone.at(east, after_s=2 * MIN)
+        assert not tracker.heading
+    # Another zone, further in, is new evidence.
+    tracker.set_rings([ring(8_000), ring(4_000)])
+    phone.at(5_000, after_s=5 * MIN)
+    phone.at(3_900, after_s=2 * MIN)
+    assert tracker.heading
+    assert tracker.reason is HomewardReason.ZONE_CROSSING
+
+
+def test_zones_start_trips_again_after_a_stay() -> None:
+    """The once-per-outing rule resets when the person stays somewhere."""
+    tracker, phone = out_of_home()
+    tracker.set_rings([ring(8_000)])
+    phone.at(9_000)
+    phone.at(7_500)  # in
+    phone.at(9_000)  # out: ends
+    assert not tracker.heading
+    phone.at(9_010, after_s=16 * MIN)  # a stay
+    phone.wait(5 * MIN)
+    phone.at(7_500, after_s=30 * MIN)  # in again, after the stay
+    assert tracker.heading
+    assert tracker.reason is HomewardReason.ZONE_CROSSING
 
 
 def test_snapshot_away_from_a_trip() -> None:
@@ -356,19 +399,26 @@ def test_save_and_load_undo_a_fix() -> None:
     assert tracker.snapshot(phone.t - 5 * MIN) == before
 
 
+def trip(since: float, farthest: float, closest: float) -> HomewardRestore:
+    """Return saved data for a trip home only."""
+    return HomewardRestore(since, HomewardTrip(since, farthest, closest))
+
+
 def test_restore_resumes_and_then_ends_like_any_trip() -> None:
     tracker = HomewardTracker(P, TARGET)
-    data = HomewardRestore(since=T0, farthest_m=30_000, closest_m=20_000)
-    assert tracker.restore(data, T0 + 10 * MIN, 21_000)
+    assert tracker.restore(trip(T0, 30_000, 20_000), T0 + 10 * MIN, 21_000)
     assert tracker.heading
     assert tracker.reason is HomewardReason.RESTORED
     snap = tracker.snapshot(T0 + 11 * MIN)
     assert snap.arrival is not None
     assert snap.farthest_m == 30_000
-    # The restored closest point still counts for moving away.
-    assert tracker.restore_data() == HomewardRestore(T0, 30_000, 20_000)
-    trip = snap.arrival - (T0 + 10 * MIN)
-    grace = max(P.homeward_overdue_s, P.homeward_overdue_ratio * trip)
+    # Saved again as it was, with when the person was last heard from: a
+    # second restart before any fix keeps it.
+    assert tracker.restore_data() == HomewardRestore(
+        T0 + 10 * MIN, HomewardTrip(T0, 30_000, 20_000)
+    )
+    trip_s = snap.arrival - (T0 + 10 * MIN)
+    grace = max(P.homeward_overdue_s, P.homeward_overdue_ratio * trip_s)
     tracker.tick(snap.arrival + grace - MIN, None)
     assert tracker.heading
     tracker.tick(snap.arrival + grace + MIN, None)
@@ -378,21 +428,22 @@ def test_restore_resumes_and_then_ends_like_any_trip() -> None:
 
 def test_restore_merges_with_a_fix_already_received() -> None:
     """After a reload the person's state is a genuine fix: kept, and merged."""
-    data = HomewardRestore(since=T0 - 30 * MIN, farthest_m=30_000, closest_m=20_000)
     tracker, phone = out_of_home()
     phone.at(19_000)
-    assert tracker.restore(data, T0 - MIN, None)
+    assert tracker.restore(trip(T0 - 30 * MIN, 30_000, 20_000), T0 - MIN, None)
     assert tracker.heading
     saved = tracker.restore_data()
     assert saved is not None
-    assert saved.since == T0 - 30 * MIN
-    assert saved.farthest_m == 30_000
-    assert saved.closest_m == pytest.approx(19_000, abs=1)
+    assert saved.last_heard == phone.t
+    assert saved.trip is not None
+    assert saved.trip.since == T0 - 30 * MIN
+    assert saved.trip.farthest_m == 30_000
+    assert saved.trip.closest_m == pytest.approx(19_000, abs=1)
     assert tracker.snapshot(phone.t).farthest_m == 30_000
 
 
 def test_restore_is_refused_at_home_after_a_change_or_without_a_distance() -> None:
-    data = HomewardRestore(since=T0, farthest_m=30_000, closest_m=20_000)
+    data = trip(T0, 30_000, 20_000)
     home = HomewardTracker(P, TARGET, at_target=True)
     assert not home.restore(data, T0, 21_000)
     assert not HomewardTracker(P, TARGET).restore(data, T0, None)
@@ -403,6 +454,40 @@ def test_restore_is_refused_at_home_after_a_change_or_without_a_distance() -> No
     phone.at(11_000, speed=-13.0)
     assert tracker.reason is HomewardReason.MOVING_AWAY
     assert not tracker.restore(data, T0, 11_000)
+
+
+def test_a_stay_survives_a_restart() -> None:
+    """Three hours at a friend's 500 m away: near home has faded, and stays so."""
+    tracker, phone = out_of_home()
+    phone.at(500, after_s=MIN)
+    phone.at(505, after_s=20 * MIN)
+    saved = tracker.restore_data()
+    assert saved is not None
+    assert saved.trip is None
+    assert saved.stay == HomewardStay(
+        T0 + MIN, *to_latlon(500, 0), pytest.approx(500, abs=1)
+    )
+    # At startup nothing has been received yet; the distance is known.
+    restarted = HomewardTracker(P, TARGET)
+    assert restarted.restore(saved, phone.t, 505)
+    assert restarted.snapshot(phone.t + 3 * 60 * MIN).still_since == T0 + MIN
+    # The next fix there carries the stay on; one elsewhere ends it.
+    restarted.add_fix(
+        Fix(*to_latlon(510, 0), 10, phone.t + 30 * MIN), 510, speed_mps=None
+    )
+    assert restarted.snapshot(phone.t + 30 * MIN).still_since == T0 + MIN
+    restarted.add_fix(
+        Fix(*to_latlon(2_000, 0), 10, phone.t + 40 * MIN), 2_000, speed_mps=None
+    )
+    assert restarted.snapshot(phone.t + 40 * MIN).still_since is None
+
+
+def test_a_saved_stay_is_dropped_if_a_reload_fix_is_elsewhere() -> None:
+    saved = HomewardRestore(T0, stay=HomewardStay(T0, *to_latlon(500, 0), 500.0))
+    tracker, phone = out_of_home()
+    phone.at(3_000)
+    assert not tracker.restore(saved, T0, None)
+    assert tracker.snapshot(phone.t).still_since is None
 
 
 def test_moving_the_target_ends_the_trip() -> None:

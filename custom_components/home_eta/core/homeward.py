@@ -10,8 +10,8 @@ questions the kinematic ETA does not:
   cross into a zone that encloses home (rings of passive zones around home
   report a crossing within seconds, long before significant-change updates
   show progress). It is latched until they get home, stay somewhere for 20
-  minutes, move back out (500 m or 15 % beyond the closest point), or go
-  quiet well past the expected arrival.
+  minutes, move back out beyond the closest point (500 m or 15 % of the
+  distance, whichever is more), or go quiet well past the expected arrival.
 - **When will they get home?** Distance over a speed. With few fixes the speed
   is the typical one for a journey home of that length (walking under 1 km, a
   local drive at a few kilometres, a motorway at 100 km), sharpened by what
@@ -33,7 +33,7 @@ real trips of 16-23 Oct 2026; none is tuned to one scenario.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from itertools import pairwise
 import math
@@ -75,7 +75,6 @@ class HomewardReason(StrEnum):
     AT_PLACE = "at_place"
     MOVING_AWAY = "moving_away"
     OVERDUE = "overdue"
-    LEFT = "left"
     ZONE_CHANGED = "zone_changed"
 
 
@@ -111,12 +110,32 @@ class HomewardSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class HomewardRestore:
-    """What survives a restart while heading home."""
+class HomewardTrip:
+    """A trip home in progress, as saved for a restart."""
 
     since: float
     farthest_m: float
     closest_m: float
+
+
+@dataclass(frozen=True, slots=True)
+class HomewardStay:
+    """Where and since when the person has been staying, as saved for a restart."""
+
+    since: float
+    latitude: float
+    longitude: float
+    distance_m: float
+
+
+@dataclass(frozen=True, slots=True)
+class HomewardRestore:
+    """What survives a restart or reload."""
+
+    last_heard: float | None
+    """When the person was last heard from."""
+    trip: HomewardTrip | None = None
+    stay: HomewardStay | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +158,8 @@ class HomewardState:
     farthest_m: float | None
     inside: frozenset[Target]
     judged: frozenset[Target]
+    spent: frozenset[Target]
+    trigger: frozenset[Target]
     inward: tuple[tuple[float, float], ...]
     trip_speed: tuple[float, SpeedSource] | None
     heading: bool
@@ -200,9 +221,9 @@ class HomewardTracker:
         self._home = at_target
         self._last: _Fix | None = None
         self._anchor: _Fix | None = None
+        """Where the person was last seen staying (or first seen after moving)."""
         self._anchor_since: float | None = None
         """When the person may have got to the anchor (at or before its fix)."""
-        """Where the person was last seen staying (or first seen after moving)."""
         self._place_since: float | None = None
         """When the person got to the anchor, once a later fix confirmed a stay."""
         self._trip_started = False
@@ -211,6 +232,10 @@ class HomewardTracker:
         """The enclosing zones the last fix was inside..."""
         self._judged: frozenset[Target] = frozenset()
         """...out of those it was checked against (a zone added since was not)."""
+        self._spent: frozenset[Target] = frozenset()
+        """Zones entered since leaving the last stay: each starts a trip once."""
+        self._trigger: frozenset[Target] = frozenset()
+        """The zones whose crossing started the trip home in progress."""
         self._inward: tuple[tuple[float, float], ...] = ()
         """(time, distance) of the last two inward crossings since leaving a place."""
         self._trip_speed: tuple[float, SpeedSource] | None = None
@@ -244,14 +269,24 @@ class HomewardTracker:
         return self._since
 
     def restore_data(self) -> HomewardRestore | None:
-        """Return what to save for a restart, while heading home."""
-        if not self._heading or self._since is None:
+        """Return what to save for a restart: a trip home, or a stay."""
+        trip: HomewardTrip | None = None
+        if (
+            self._heading
+            and self._since is not None
+            and self._farthest_m is not None
+            and self._closest_m is not None
+        ):
+            trip = HomewardTrip(self._since, self._farthest_m, self._closest_m)
+        stay: HomewardStay | None = None
+        anchor, since = self._anchor, self._place_since
+        if not self._home and anchor is not None and since is not None:
+            stay = HomewardStay(
+                since, anchor.latitude, anchor.longitude, anchor.distance_m
+            )
+        if trip is None and stay is None:
             return None
-        farthest = self._farthest_m
-        closest = self._closest_m
-        if farthest is None or closest is None:
-            return None
-        return HomewardRestore(self._since, farthest, closest)
+        return HomewardRestore(self._last_time(), trip, stay)
 
     def save(self) -> HomewardState:
         """Return the state, to put back with ``load`` if a fix was a glitch."""
@@ -264,6 +299,8 @@ class HomewardTracker:
             farthest_m=self._farthest_m,
             inside=self._inside,
             judged=self._judged,
+            spent=self._spent,
+            trigger=self._trigger,
             inward=self._inward,
             trip_speed=self._trip_speed,
             heading=self._heading,
@@ -282,6 +319,8 @@ class HomewardTracker:
         self._farthest_m = saved.farthest_m
         self._inside = saved.inside
         self._judged = saved.judged
+        self._spent = saved.spent
+        self._trigger = saved.trigger
         self._inward = saved.inward
         self._trip_speed = saved.trip_speed
         self._heading = saved.heading
@@ -330,37 +369,58 @@ class HomewardTracker:
         kept = frozenset(rings)
         self._inside &= kept
         self._judged &= kept
+        self._spent &= kept
+        self._trigger &= kept
 
     def restore(
         self, data: HomewardRestore, last_heard: float, distance_m: float | None
     ) -> bool:
-        """Resume a trip home saved before a restart or reload.
+        """Resume a stay and a trip home saved before a restart or reload.
 
-        Only while nothing has happened to the trip home in this run. A fix
-        already received (after a reload, the person's state is genuine) is
-        kept, and the saved farthest and closest points merged with it. The
-        trip then ends like any other: the next fixes, a stay or the overdue
-        rule decide.
+        ``distance_m`` is the person's distance now, for when no fix has been
+        received in this run (at startup, the person's state is the one saved
+        at shutdown, not a fix). After a reload it is a genuine fix: a saved
+        stay is kept if that fix is still there, and the trip's farthest and
+        closest points are merged with it. Only while nothing has happened to
+        the trip home in this run. From then on both end like any other: the
+        next fixes, a stay or the overdue rule decide.
         """
-        if self._home or self._heading or self._reason is not HomewardReason.INITIAL:
+        if self._home:
             return False
         last = self._last
         if last is None:
             if distance_m is None or not math.isfinite(distance_m) or distance_m < 0:
                 return False
-            self._restored_heard = last_heard
-            self._restored_distance_m = distance_m
             current = distance_m
         else:
             current = last.distance_m
-        farthest = self._farthest_m
-        self._trip_started = True
-        self._farthest_m = max(data.farthest_m, current, farthest or 0.0)
-        self._closest_m = min(data.closest_m, current)
-        self._heading = True
-        self._reason = HomewardReason.RESTORED
-        self._since = data.since
-        return True
+        restored = False
+        stay = data.stay
+        if stay is not None and self._place_since is None:
+            place = _Fix(stay.since, stay.latitude, stay.longitude, stay.distance_m)
+            if last is None or _ground_m(place, last) <= self._p.place_radius_m:
+                self._anchor = place
+                self._anchor_since = stay.since
+                self._place_since = stay.since
+                self._trip_started = True
+                restored = True
+        trip = data.trip
+        if (
+            trip is not None
+            and not self._heading
+            and self._reason is HomewardReason.INITIAL
+        ):
+            self._trip_started = True
+            self._farthest_m = max(trip.farthest_m, current, self._farthest_m or 0.0)
+            self._closest_m = min(trip.closest_m, current)
+            self._heading = True
+            self._reason = HomewardReason.RESTORED
+            self._since = trip.since
+            restored = True
+        if restored and last is None:
+            self._restored_heard = last_heard
+            self._restored_distance_m = distance_m
+        return restored
 
     # -- input -----------------------------------------------------------
 
@@ -372,35 +432,45 @@ class HomewardTracker:
             self._end(HomewardReason.ARRIVED, t)
 
     def depart(self, t: float) -> None:
-        """The person has left home."""
+        """The person has left home (never heading home then: arriving ends it)."""
         if not self._home:
             return
         self._clear_trip()
         self._home = False
-        if self._heading:
-            self._end(HomewardReason.LEFT, t)
 
     def add_fix(
-        self, report: Fix, distance_m: float, *, speed_mps: float | None
+        self,
+        report: Fix,
+        distance_m: float,
+        *,
+        speed_mps: float | None,
+        still: bool = False,
     ) -> None:
         """Process an accepted fix away from home.
 
         ``distance_m`` is to the target centre; ``speed_mps`` is the filtered
-        closing speed when it is fresh, else None.
+        closing speed when it is fresh, else None. ``still`` is True when the
+        kinematic estimator saw no movement in this fix: it learns how far
+        this phone's indoor positions wander (Wi-Fi fixes indoors can bounce
+        200-300 m), so it is trusted over the place radius.
         """
         if self._home:
             return
         p = self._p
         t, latitude, longitude = report.timestamp, report.latitude, report.longitude
+        last_time = self._last_time()
+        if last_time is not None and last_time - t > p.clock_step_back_s:
+            # The clock stepped back: keep the gaps between what is stored.
+            self._shift_times(t - last_time)
+        previous = self._last
         accuracy_m = report.accuracy_m
         fix = _Fix(t, latitude, longitude, distance_m)
-        previous = self._last
         self._restored_heard = self._restored_distance_m = None
 
         # Staying, or moving on?
         anchor = self._anchor
         radius = max(p.place_radius_m, p.place_accuracy_factor * accuracy_m)
-        if anchor is not None and _ground_m(anchor, fix) <= radius:
+        if anchor is not None and (still or _ground_m(anchor, fix) <= radius):
             moved = False
             if self._place_since is None and t - anchor.t >= p.place_confirm_s:
                 self._place_since = anchor.t
@@ -409,9 +479,15 @@ class HomewardTracker:
             leaving_stay = self._place_since is not None
             if leaving_stay or not self._trip_started:
                 # Leaving a stay (or home): distances are measured from here.
-                start = previous.distance_m if previous is not None else distance_m
+                if previous is not None:
+                    start = previous.distance_m
+                elif anchor is not None:
+                    start = anchor.distance_m  # a stay restored after a restart
+                else:
+                    start = distance_m
                 self._farthest_m = max(start, distance_m)
                 self._inward = ()
+                self._spent = frozenset()
                 self._trip_started = True
             self._anchor = fix
             # Back-dated only on a trip home that was already on through the
@@ -431,7 +507,11 @@ class HomewardTracker:
         # Crossings of the zones around home, judged on the fix's centre and
         # only between fixes that moved: GPS jitter at a stop near a zone's
         # edge is not a crossing.
-        crossed_in = False
+        # A zone starts a trip home once per outing (since the last stay), so
+        # a road weaving along a zone's edge cannot keep restarting it; and
+        # leaving the zone that started the trip ends it.
+        entered: frozenset[Target] = frozenset()
+        left_trigger = False
         if moved:
             inside = frozenset(
                 ring
@@ -439,24 +519,37 @@ class HomewardTracker:
                 if haversine_m(latitude, longitude, ring.latitude, ring.longitude)
                 <= ring.radius_m
             )
-            crossed_in = bool((inside - self._inside) & self._judged)
+            crossed = (inside - self._inside) & self._judged
+            left_trigger = bool((self._inside - inside) & self._judged & self._trigger)
+            entered = crossed - self._spent
+            self._spent |= crossed
             self._inside = inside
             self._judged = frozenset(self._rings)
-            if crossed_in:
+            if entered:
                 self._inward = (*self._inward[-1:], (t, distance_m))
         self._last = fix
         self._trip_speed = self._speed_at(t, distance_m, speed_mps)
-        self._evaluate(t, speed_mps, crossed_in=crossed_in)
+        self._evaluate(t, speed_mps, entered=entered, left_trigger=left_trigger)
 
     def tick(self, now: float, speed_mps: float | None) -> None:
         """Re-evaluate the time-driven rules."""
-        if not self._home:
-            self._evaluate(now, speed_mps, crossed_in=False)
+        if self._home:
+            return
+        last_time = self._last_time()
+        if last_time is not None and last_time - now > self._p.clock_step_back_s:
+            # The clock stepped back: keep the gaps between what is stored.
+            self._shift_times(now - last_time)
+        self._evaluate(now, speed_mps)
 
     # -- rules -----------------------------------------------------------
 
     def _evaluate(
-        self, now: float, speed_mps: float | None, *, crossed_in: bool
+        self,
+        now: float,
+        speed_mps: float | None,
+        *,
+        entered: frozenset[Target] = frozenset(),
+        left_trigger: bool = False,
     ) -> None:
         p = self._p
         distance = self._distance()
@@ -481,7 +574,7 @@ class HomewardTracker:
             )
             if at_place:
                 self._end(HomewardReason.AT_PLACE, now)
-            elif distance - closest >= max(
+            elif left_trigger or distance - closest >= max(
                 p.homeward_cancel_m, p.homeward_cancel_ratio * distance
             ):
                 self._end(HomewardReason.MOVING_AWAY, now)
@@ -490,11 +583,15 @@ class HomewardTracker:
                 self._farthest_m = distance
             elif arrival is not None and now - arrival > grace:
                 self._end(HomewardReason.OVERDUE, now)
+                # Only new progress or a new zone starts it again: the closing
+                # speed can stay "fresh" for longer than the grace.
+                self._farthest_m = distance
             return
         if at_place:
             return
-        if crossed_in:
+        if entered:
             self._start(HomewardReason.ZONE_CROSSING, now, distance)
+            self._trigger = entered
             return
         farthest = self._farthest_m
         if (
@@ -511,12 +608,30 @@ class HomewardTracker:
         self._reason = reason
         self._since = now
         self._closest_m = distance
+        self._trigger = frozenset()
 
     def _end(self, reason: HomewardReason, now: float) -> None:
         self._heading = False
         self._reason = reason
         self._since = now
         self._closest_m = None
+        self._trigger = frozenset()
+
+    def _shift_times(self, delta: float) -> None:
+        """Move every stored time by ``delta`` (after the clock stepped back)."""
+
+        def shift(value: float | None) -> float | None:
+            return None if value is None else value + delta
+
+        if self._last is not None:
+            self._last = replace(self._last, t=self._last.t + delta)
+        if self._anchor is not None:
+            self._anchor = replace(self._anchor, t=self._anchor.t + delta)
+        self._anchor_since = shift(self._anchor_since)
+        self._place_since = shift(self._place_since)
+        self._since = shift(self._since)
+        self._restored_heard = shift(self._restored_heard)
+        self._inward = tuple((t + delta, d) for t, d in self._inward)
 
     def _clear_trip(self) -> None:
         self._last = None
@@ -527,6 +642,8 @@ class HomewardTracker:
         self._farthest_m = None
         self._inside = frozenset()
         self._judged = frozenset()
+        self._spent = frozenset()
+        self._trigger = frozenset()
         self._inward = ()
         self._trip_speed = None
         self._restored_heard = self._restored_distance_m = None

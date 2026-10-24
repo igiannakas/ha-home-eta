@@ -87,8 +87,7 @@
             "state": {
               "arrived": "Arrived",
               "at_place": "Staying somewhere",
-              "initial": "Started",
-              "left": "Left",
+              "initial": "No trip home yet",
               "moving_away": "Moving away",
               "overdue": "Overdue",
               "progress": "Getting closer",
@@ -298,8 +297,7 @@
             "state": {
               "arrived": "Arrived",
               "at_place": "Staying somewhere",
-              "initial": "Started",
-              "left": "Left",
+              "initial": "No trip home yet",
               "moving_away": "Moving away",
               "overdue": "Overdue",
               "progress": "Getting closer",
