@@ -117,6 +117,66 @@ def test_good_trips_pass(
     assert samples[-1]["historical_s"] is not None
 
 
+def test_heading_home_is_scored(
+    backtest: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Out to 12 km, an hour there, then the drive home: spotted on the way."""
+    segments = [
+        Segment((12_000.0, 0.0), 12.0, dwell_s=3_600.0),
+        Segment((0.0, 0.0), 12.0),
+    ]
+    _, result = run(backtest, tmp_path, [journeys(6, segments=segments, start_m=300.0)])
+    heading = result[PERSON]["heading_home"]
+    assert len(heading["warning_s"]) == 6
+    # 20 % of 12 km is 2.4 km, about 3-8 minutes into the 16-minute drive.
+    assert all(8 * 60 <= w <= 17 * 60 for w in heading["warning_s"])
+    assert heading["false_starts"] == 0
+    out = capsys.readouterr().out
+    assert "heading home: on at arrival in 6 of 6 trips" in out
+    assert "heading home that was not: 0 times, 0.0 h in all" in out
+
+
+def test_rings_given_with_their_shape_are_replayed(
+    backtest: ModuleType, tmp_path: Path
+) -> None:
+    """A ring at 8 km starts the trip home on the way in, before 20 % progress."""
+    segments = [
+        Segment((9_000.0, 0.0), 12.0, dwell_s=3_600.0),
+        Segment((0.0, 0.0), 12.0),
+    ]
+    export = [journeys(6, segments=segments, start_m=300.0)]
+    _, plain = run(backtest, tmp_path, export)
+    _, ringed = run(
+        backtest,
+        tmp_path,
+        export,
+        "--enclosing-zone",
+        f"zone.ring_8_km={HOME_LAT},{HOME_LON},8000",
+    )
+    plain_warnings = plain[PERSON]["heading_home"]["warning_s"]
+    ringed_warnings = ringed[PERSON]["heading_home"]["warning_s"]
+    assert all(r >= w for r, w in zip(ringed_warnings, plain_warnings, strict=True))
+    assert sum(ringed_warnings) > sum(plain_warnings)
+    # Without its shape a zone around home still counts as enclosing (for
+    # arriving soon) but cannot be replayed as a ring.
+    _, named = run(backtest, tmp_path, export, "--enclosing-zone", "zone.ring_8_km")
+    assert named[PERSON]["heading_home"]["warning_s"] == plain_warnings
+
+
+@pytest.mark.parametrize(
+    "value", ["ring", "zone.ring=51,0", "zone.ring=51,0,-1", "zone.ring="]
+)
+def test_bad_enclosing_zone_refused(
+    backtest: ModuleType, tmp_path: Path, value: str
+) -> None:
+    export = tmp_path / "history.json"
+    export.write_text("[]", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        backtest.main(
+            ["--input", str(export), "--zone", ZONE_ARG, "--enclosing-zone", value]
+        )
+
+
 def test_early_arriving_soon_fails(
     backtest: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -404,7 +464,8 @@ def test_pull_from_home_assistant(
     out = capsys.readouterr().out
     assert f"{PERSON}: 6 trips" in out
     # The neighbourhood wholly contains home; the station does not.
-    assert "--enclosing-zone zone.neighbourhood" in out
+    near_lat, near_lon = offset_m(HOME_LAT, HOME_LON, 300.0, 0.0)
+    assert f"--enclosing-zone zone.neighbourhood={near_lat},{near_lon},2000" in out
     assert "zone.station" not in out
 
     history_url = requests[0].full_url

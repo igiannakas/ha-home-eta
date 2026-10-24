@@ -1,6 +1,6 @@
 [project]
 name = "ha-home-eta"
-version = "1.0.0"
+version = "1.1.0"
 description = "Home Assistant integration estimating when each person, and the first of them, will arrive home."
 readme = "README.md"
 license = { text = "GPL-3.0-only" }

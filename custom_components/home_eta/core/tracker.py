@@ -7,7 +7,7 @@ backtest replay exactly the same logic.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 import math
@@ -24,6 +24,12 @@ from .approach import (
 )
 from .geo import haversine_m, is_valid_coordinate
 from .historical import HistoricalEstimate, HistoricalEstimator
+from .homeward import (
+    HomewardRestore,
+    HomewardSnapshot,
+    HomewardState,
+    HomewardTracker,
+)
 from .kinematic import (
     Confidence,
     Fix,
@@ -109,6 +115,8 @@ class TrackerSnapshot:
     fixes_in_trip: int
     trips_learned: int
     last_trip_at: float | None
+    homeward: HomewardSnapshot | None = None
+    """The trip home; None at home."""
 
     @property
     def in_other_zone(self) -> bool:
@@ -152,6 +160,9 @@ class PersonTracker:
             if config.historical
             else None
         )
+        self._homeward = HomewardTracker(config.params, target, at_target=at_target)
+        self._homeward_before_move: HomewardState | None = None
+        """The heading-home state before the latest move, while it may be undone."""
         self._threshold_s = DEFAULT_ARRIVING_SOON_MIN * 60.0
         self._other_zones: tuple[str, ...] = ()
         self._in_ignored = False
@@ -197,6 +208,15 @@ class PersonTracker:
         """Return the historical estimator, when enabled."""
         return self._historical
 
+    @property
+    def homeward(self) -> HomewardTracker:
+        """Return the heading-home tracker."""
+        return self._homeward
+
+    def set_rings(self, rings: Iterable[Target]) -> None:
+        """Set the zones that enclose the target (rings around home)."""
+        self._homeward.set_rings(rings)
+
     def set_threshold(self, seconds: float) -> None:
         """Set the arriving-soon threshold."""
         if not math.isfinite(seconds) or seconds <= 0:
@@ -220,7 +240,9 @@ class PersonTracker:
         )
         self._target = target
         self._kinematic.set_target(target)
+        self._homeward.set_target(target, now)
         self._before_move = None
+        self._homeward_before_move = None
         self._distance_m = None
         self._mark_reference(now)
         historical = self._historical
@@ -244,6 +266,19 @@ class PersonTracker:
         if not self._approach.restore(state, since):
             return False
         self._mark_reference(last_heard)
+        return True
+
+    def restore_homeward(
+        self, data: HomewardRestore, last_heard: float, now: float
+    ) -> bool:
+        """Resume a trip home saved before a restart.
+
+        It ends like any other: the first fixes, a stay or the overdue rule,
+        which is applied at once.
+        """
+        if not self._homeward.restore(data, last_heard, self._distance_m):
+            return False
+        self._homeward.tick(now, self._fresh_speed(now))
         return True
 
     def last_heard(self, now: float) -> float | None:
@@ -288,7 +323,9 @@ class PersonTracker:
         transition = self._approach.depart(t)
         if transition is not None:
             self._kinematic.reset()
+            self._homeward.depart(t)
             self._before_move = None
+            self._homeward_before_move = None
             self._trip_started_at = t
             self._fixes_in_trip = 0
             if use_for_kinematics:
@@ -332,6 +369,7 @@ class PersonTracker:
         if outcome is not None and outcome.rolled_back:
             transition = _chain(transition, self._undo_glitch(t))
         if outcome is not None and outcome.accepted:
+            self._feed_homeward(t, position, accuracy, outcome)
             self._fixes_in_trip += 1
             # Kept until the next accepted fix shows the move was real.
             self._before_move = (
@@ -349,17 +387,51 @@ class PersonTracker:
             transition = _chain(
                 transition, self._approach.on_tick(self._observation(t))
             )
+            self._homeward.tick(t, self._fresh_speed(t))
             self._end_leg_if_stopped()
         return UpdateResult(outcome, transition)
 
     def tick(self, now: float) -> Transition | None:
         """Re-evaluate time-driven rules."""
         transition = self._approach.on_tick(self._observation(now))
+        self._homeward.tick(now, self._fresh_speed(now))
         self._end_leg_if_stopped()
         return transition
 
+    def _feed_homeward(
+        self,
+        t: float,
+        position: tuple[float, float] | None,
+        accuracy: float,
+        outcome: FixOutcome,
+    ) -> None:
+        """Give an accepted fix to the heading-home tracker."""
+        homeward = self._homeward
+        if outcome.rolled_back and self._homeward_before_move is not None:
+            # The previous fix jumped away and this one is back: undo it here too.
+            homeward.load(self._homeward_before_move)
+        self._homeward_before_move = (
+            homeward.save() if outcome.verdict is FixVerdict.MOVED else None
+        )
+        if position is None or outcome.distance_m is None:
+            return
+        homeward.add_fix(
+            Fix(position[0], position[1], accuracy, t),
+            outcome.distance_m,
+            speed_mps=self._fresh_speed(t),
+        )
+
+    def _fresh_speed(self, now: float) -> float | None:
+        """Return the filtered closing speed, unless stopped or stale."""
+        kinematic = self._kinematic
+        if kinematic.stopped or kinematic.is_stale(now):
+            return None
+        return kinematic.closing_speed_mps
+
     def _arrive(self, t: float) -> UpdateResult:
         transition = self._approach.arrive(t)
+        self._homeward.arrive(t)
+        self._homeward_before_move = None
         learned = 0
         if transition is not None:
             if self._historical is not None:
@@ -495,6 +567,7 @@ class PersonTracker:
             fixes_in_trip=self._fixes_in_trip,
             trips_learned=0 if hist is None else hist.trips_learned,
             last_trip_at=None if hist is None else hist.last_trip_at,
+            homeward=None if at_home else self._homeward.snapshot(now),
         )
 
     def diagnostics(self) -> dict[str, Any]:
@@ -503,6 +576,7 @@ class PersonTracker:
         return {
             "kinematic": self._kinematic.diagnostics(),
             "approach": self._approach.diagnostics(),
+            "homeward": self._homeward.diagnostics(),
             "threshold_s": self._threshold_s,
             "other_zones": list(self._other_zones),
             "in_ignored_zone": self._in_ignored,

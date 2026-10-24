@@ -17,14 +17,18 @@
         "data": {
           "members": "People",
           "name": "Name",
-          "zone": "Destination zone"
+          "zone": "Destination zone",
+          "near_home_fade_after_min": "Near home fades after",
+          "near_home_radius_m": "Near-home radius"
         },
         "data_description": {
           "members": "People already added to Home ETA for this zone.",
           "name": "Used for the device and its entity IDs.",
-          "zone": "Must match the zone the people are tracked to."
+          "zone": "Must match the zone the people are tracked to.",
+          "near_home_fade_after_min": "After someone has stayed at one place this long, Near home fades to 0 % over an hour, so an afternoon at a friend's nearby does not keep the house warm throughout. 0 never fades.",
+          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way people are going."
         },
-        "description": "Shows who is due first, and whether anyone is arriving soon.",
+        "description": "Shows who is due first, whether anyone is arriving soon, when the first person heading home is expected, and how near home the nearest person is.",
         "title": "Add a first-arrival group"
       },
       "person": {
@@ -63,6 +67,53 @@
         "state_attributes": {
           "threshold_min": {
             "name": "Threshold"
+          }
+        }
+      },
+      "heading_home": {
+        "name": "Heading home",
+        "state_attributes": {
+          "expected_at": {
+            "name": "Expected home"
+          },
+          "farthest_m": {
+            "name": "Farthest since last stay"
+          },
+          "minutes": {
+            "name": "Minutes to home"
+          },
+          "reason": {
+            "name": "Reason",
+            "state": {
+              "arrived": "Arrived",
+              "at_place": "Staying somewhere",
+              "initial": "Started",
+              "left": "Left",
+              "moving_away": "Moving away",
+              "overdue": "Overdue",
+              "progress": "Getting closer",
+              "restored": "Restored",
+              "zone_changed": "Zone changed",
+              "zone_crossing": "Entered a zone around home"
+            }
+          },
+          "since": {
+            "name": "Since"
+          },
+          "speed_mps": {
+            "name": "Speed"
+          },
+          "speed_source": {
+            "name": "Speed from",
+            "state": {
+              "measured": "Measured",
+              "on_foot": "On foot",
+              "typical": "Typical for the distance",
+              "zone_crossings": "Between zones around home"
+            }
+          },
+          "staying_since": {
+            "name": "Staying since"
           }
         }
       },
@@ -218,6 +269,56 @@
           }
         }
       },
+      "expected_home": {
+        "name": "Expected home",
+        "state_attributes": {
+          "distance_m": {
+            "name": "Distance"
+          },
+          "heading_home": {
+            "name": "Heading home"
+          },
+          "minutes": {
+            "name": "Minutes"
+          },
+          "missing_members": {
+            "name": "Missing members"
+          },
+          "person": {
+            "name": "Person"
+          },
+          "person_name": {
+            "name": "Person name"
+          },
+          "persons_home": {
+            "name": "Home"
+          },
+          "reason": {
+            "name": "Reason",
+            "state": {
+              "arrived": "Arrived",
+              "at_place": "Staying somewhere",
+              "initial": "Started",
+              "left": "Left",
+              "moving_away": "Moving away",
+              "overdue": "Overdue",
+              "progress": "Getting closer",
+              "restored": "Restored",
+              "zone_changed": "Zone changed",
+              "zone_crossing": "Entered a zone around home"
+            }
+          },
+          "speed_source": {
+            "name": "Speed from",
+            "state": {
+              "measured": "Measured",
+              "on_foot": "On foot",
+              "typical": "Typical for the distance",
+              "zone_crossings": "Between zones around home"
+            }
+          }
+        }
+      },
       "first_arrival": {
         "name": "First arrival",
         "state_attributes": {
@@ -254,6 +355,32 @@
       },
       "minutes_to_home": {
         "name": "Minutes to home"
+      },
+      "near_home": {
+        "name": "Near home",
+        "state_attributes": {
+          "distance_m": {
+            "name": "Distance"
+          },
+          "fade_after_min": {
+            "name": "Fades after"
+          },
+          "person": {
+            "name": "Person"
+          },
+          "person_name": {
+            "name": "Person name"
+          },
+          "persons_home": {
+            "name": "Home"
+          },
+          "radius_m": {
+            "name": "Radius"
+          },
+          "staying_since": {
+            "name": "Staying since"
+          }
+        }
       }
     }
   },
@@ -300,14 +427,18 @@
           "enable_historical": "Learn arrival times from past trips",
           "ignored_zones": "Zones that end a trip",
           "members": "People",
-          "reference_eta_entity": "Reference travel-time sensor"
+          "reference_eta_entity": "Reference travel-time sensor",
+          "near_home_fade_after_min": "Near home fades after",
+          "near_home_radius_m": "Near-home radius"
         },
         "data_description": {
           "activity_entity": "Optional. The Companion app activity sensor, shown as an attribute only.",
           "enable_historical": "Adds a second ETA sensor based on how long past trips took from the same distance. Turning it off deletes the learned trips.",
           "ignored_zones": "Optional. Time spent here (for example at work) is never learned as travel time.",
           "members": "People tracked to this group's zone.",
-          "reference_eta_entity": "Optional. A Waze, Google or HERE travel-time sensor, shown as an attribute for comparison."
+          "reference_eta_entity": "Optional. A Waze, Google or HERE travel-time sensor, shown as an attribute for comparison.",
+          "near_home_fade_after_min": "After someone has stayed at one place this long, Near home fades to 0 % over an hour, so an afternoon at a friend's nearby does not keep the house warm throughout. 0 never fades.",
+          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way people are going."
         },
         "sections": {
           "advanced": {

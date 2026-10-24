@@ -37,6 +37,18 @@ ADVANCED_PARAMS: Final = (
 
 # Group entries: options
 CONF_MEMBERS: Final = "members"
+CONF_NEAR_HOME_RADIUS_M: Final = "near_home_radius_m"
+CONF_NEAR_HOME_FADE_AFTER_MIN: Final = "near_home_fade_after_min"
+
+DEFAULT_NEAR_HOME_RADIUS_M: Final = 3_000
+MIN_NEAR_HOME_RADIUS_M: Final = 1_000
+MAX_NEAR_HOME_RADIUS_M: Final = 30_000
+NEAR_HOME_FULL_M: Final = 800.0
+"""Near home is 100 % at this distance or closer."""
+DEFAULT_NEAR_HOME_FADE_AFTER_MIN: Final = 90
+MAX_NEAR_HOME_FADE_AFTER_MIN: Final = 720
+NEAR_HOME_FADE_MIN: Final = 60
+"""After the fade starts, near home falls to 0 over this many minutes."""
 
 DEFAULT_ZONE: Final = "zone.home"
 DEFAULT_GROUP_NAME: Final = "Home ETA"
@@ -67,3 +79,6 @@ KEY_FIRST_ARRIVAL: Final = "first_arrival"
 KEY_FIRST_PERSON: Final = "first_arrival_person"
 KEY_FIRST_MINUTES: Final = "first_arrival_minutes"
 KEY_SOMEONE_SOON: Final = "someone_arriving_soon"
+KEY_HEADING_HOME: Final = "heading_home"
+KEY_EXPECTED_HOME: Final = "expected_home"
+KEY_NEAR_HOME: Final = "near_home"

@@ -17,6 +17,8 @@ from custom_components.home_eta.const import (
     CONF_ENTRY_TYPE,
     CONF_IGNORED_ZONES,
     CONF_MEMBERS,
+    CONF_NEAR_HOME_FADE_AFTER_MIN,
+    CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
     CONF_ZONE,
     DOMAIN,
@@ -152,8 +154,15 @@ async def test_add_group(hass: HomeAssistant) -> None:
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Home ETA"
     assert result["data"] == {CONF_ENTRY_TYPE: ENTRY_TYPE_GROUP, CONF_ZONE: "zone.home"}
-    assert result["options"] == {CONF_MEMBERS: [ALEX, SAM]}
+    # The near-home settings take their defaults.
+    assert result["options"] == {
+        CONF_MEMBERS: [ALEX, SAM],
+        CONF_NEAR_HOME_RADIUS_M: 3_000,
+        CONF_NEAR_HOME_FADE_AFTER_MIN: 90,
+    }
     assert hass.states.get("sensor.home_eta_first_arrival") is not None
+    assert hass.states.get("sensor.home_eta_expected_home") is not None
+    assert hass.states.get("sensor.home_eta_near_home") is not None
 
 
 async def test_person_options(hass: HomeAssistant) -> None:
@@ -208,17 +217,64 @@ async def test_group_options(hass: HomeAssistant) -> None:
     group = entries[2]
 
     result = await hass.config_entries.options.async_init(group.entry_id)
+    # An entry made before the near-home settings existed shows the defaults.
+    schema = result["data_schema"].schema
+    suggested = {
+        str(key): key.description["suggested_value"]
+        for key in schema
+        if key.description and "suggested_value" in key.description
+    }
+    assert suggested == {
+        CONF_MEMBERS: [ALEX],
+        CONF_NEAR_HOME_RADIUS_M: 3_000,
+        CONF_NEAR_HOME_FADE_AFTER_MIN: 90,
+    }
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {CONF_MEMBERS: []}
     )
     assert result["errors"] == {CONF_MEMBERS: "no_members"}
     result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {CONF_MEMBERS: [ALEX, SAM]}
+        result["flow_id"],
+        {
+            CONF_MEMBERS: [ALEX, SAM],
+            CONF_NEAR_HOME_RADIUS_M: 5_000,
+            CONF_NEAR_HOME_FADE_AFTER_MIN: 0,
+        },
     )
     await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert group.options[CONF_MEMBERS] == [ALEX, SAM]
     assert group.runtime_data.members == (ALEX, SAM)
+    config = group.runtime_data.near_config
+    assert config.radius_m == 5_000
+    assert config.fade_after_s is None
+    near = hass.states.get("sensor.home_eta_near_home")
+    assert near.attributes["radius_m"] == 5_000
+    assert near.attributes["fade_after_min"] is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (CONF_NEAR_HOME_RADIUS_M, 999),
+        (CONF_NEAR_HOME_RADIUS_M, 30_001),
+        (CONF_NEAR_HOME_FADE_AFTER_MIN, -5),
+        (CONF_NEAR_HOME_FADE_AFTER_MIN, 721),
+    ],
+)
+async def test_group_options_out_of_range(
+    hass: HomeAssistant, field: str, value: int
+) -> None:
+    set_person(hass, ALEX, 5_000)
+    entries = [person_entry(ALEX), group_entry([ALEX])]
+    for entry in entries:
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+    result = await hass.config_entries.options.async_init(entries[1].entry_id)
+    with pytest.raises(InvalidData):
+        await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_MEMBERS: [ALEX], field: value}
+        )
 
 
 async def test_duplicate_group_aborts(hass: HomeAssistant) -> None:

@@ -26,14 +26,21 @@ from .const import (
     CONF_ENTRY_TYPE,
     CONF_IGNORED_ZONES,
     CONF_MEMBERS,
+    CONF_NEAR_HOME_FADE_AFTER_MIN,
+    CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
     CONF_REFERENCE_ETA_ENTITY,
     CONF_ZONE,
     DEFAULT_GROUP_NAME,
+    DEFAULT_NEAR_HOME_FADE_AFTER_MIN,
+    DEFAULT_NEAR_HOME_RADIUS_M,
     DEFAULT_ZONE,
     DOMAIN,
     ENTRY_TYPE_GROUP,
     ENTRY_TYPE_PERSON,
+    MAX_NEAR_HOME_FADE_AFTER_MIN,
+    MAX_NEAR_HOME_RADIUS_M,
+    MIN_NEAR_HOME_RADIUS_M,
 )
 from .core import params as defaults
 from .runtime import friendly_name, params_from_options, target_from_state
@@ -69,6 +76,48 @@ ADVANCED_FIELDS: tuple[tuple[str, float, float, float, float, str], ...] = (
         "s",
     ),
 )
+
+
+def _near_home_fields() -> dict[probatio.Marker, Any]:
+    return {
+        probatio.Required(
+            CONF_NEAR_HOME_RADIUS_M, default=DEFAULT_NEAR_HOME_RADIUS_M
+        ): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=MIN_NEAR_HOME_RADIUS_M,
+                max=MAX_NEAR_HOME_RADIUS_M,
+                step=100,
+                unit_of_measurement="m",
+                mode=selector.NumberSelectorMode.BOX,
+            )
+        ),
+        probatio.Required(
+            CONF_NEAR_HOME_FADE_AFTER_MIN, default=DEFAULT_NEAR_HOME_FADE_AFTER_MIN
+        ): selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0,
+                max=MAX_NEAR_HOME_FADE_AFTER_MIN,
+                step=5,
+                unit_of_measurement="min",
+                mode=selector.NumberSelectorMode.BOX,
+            )
+        ),
+    }
+
+
+def _group_options(user_input: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a group's options from a submitted form."""
+    return {
+        CONF_MEMBERS: list(user_input.get(CONF_MEMBERS) or []),
+        CONF_NEAR_HOME_RADIUS_M: int(
+            user_input.get(CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M)
+        ),
+        CONF_NEAR_HOME_FADE_AFTER_MIN: int(
+            user_input.get(
+                CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN
+            )
+        ),
+    }
 
 
 def _person_option_fields() -> dict[probatio.Marker, Any]:
@@ -244,10 +293,10 @@ class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             zone = user_input[CONF_ZONE]
-            members = list(user_input.get(CONF_MEMBERS) or [])
+            options = _group_options(user_input)
             if target_from_state(self.hass.states.get(zone)) is None:
                 errors[CONF_ZONE] = "zone_invalid"
-            _validate_members(self.hass, zone, members, errors)
+            _validate_members(self.hass, zone, options[CONF_MEMBERS], errors)
             if not errors:
                 await self.async_set_unique_id(
                     f"group|{zone}|{slugify(user_input[CONF_NAME])}"
@@ -256,7 +305,7 @@ class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(
                     title=user_input[CONF_NAME],
                     data={CONF_ENTRY_TYPE: ENTRY_TYPE_GROUP, CONF_ZONE: zone},
-                    options={CONF_MEMBERS: members},
+                    options=options,
                 )
 
         schema = probatio.Schema(
@@ -268,6 +317,7 @@ class HomeEtaConfigFlow(ConfigFlow, domain=DOMAIN):
                     selector.EntitySelectorConfig(domain="zone")
                 ),
                 probatio.Required(CONF_MEMBERS): _members_selector(self.hass, None),
+                **_near_home_fields(),
             }
         )
         return self.async_show_form(
@@ -325,33 +375,43 @@ class PersonOptionsFlow(OptionsFlowWithReload):
 
 
 class GroupOptionsFlow(OptionsFlowWithReload):
-    """Change who is in a group."""
+    """Change who is in a group and how near home is measured."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Show and save the members."""
+        """Show and save the members and near-home settings."""
         errors: dict[str, str] = {}
         zone = self.config_entry.data[CONF_ZONE]
         if user_input is not None:
-            members = list(user_input.get(CONF_MEMBERS) or [])
-            _validate_members(self.hass, zone, members, errors)
+            options = _group_options(user_input)
+            _validate_members(self.hass, zone, options[CONF_MEMBERS], errors)
             if not errors:
-                return self.async_create_entry(data={CONF_MEMBERS: members})
+                return self.async_create_entry(data=options)
 
         schema = probatio.Schema(
-            {probatio.Required(CONF_MEMBERS): _members_selector(self.hass, zone)}
+            {
+                probatio.Required(CONF_MEMBERS): _members_selector(self.hass, zone),
+                **_near_home_fields(),
+            }
         )
         if user_input is None:
             # Offer only members that are still tracked, so the form can be
             # saved as shown even if a person was removed meanwhile.
             tracked = _tracked_persons(self.hass, zone)
+            saved = self.config_entry.options
             current = [
-                member
-                for member in self.config_entry.options.get(CONF_MEMBERS) or []
-                if member in tracked
+                member for member in saved.get(CONF_MEMBERS) or [] if member in tracked
             ]
-            suggested: Mapping[str, Any] = {CONF_MEMBERS: current}
+            suggested: Mapping[str, Any] = {
+                CONF_MEMBERS: current,
+                CONF_NEAR_HOME_RADIUS_M: saved.get(
+                    CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M
+                ),
+                CONF_NEAR_HOME_FADE_AFTER_MIN: saved.get(
+                    CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN
+                ),
+            }
         else:
             suggested = user_input
         return self.async_show_form(

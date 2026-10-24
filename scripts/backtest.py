@@ -17,6 +17,11 @@ websocket ``history/history_during_period`` result, made without
 
     python3 scripts/backtest.py --input history.json --zone LATITUDE,LONGITUDE,RADIUS_M
 
+Besides the ETAs it scores "heading home" (the signal for warming the house):
+how long before each arrival it came on for good, and how often it came on
+for a trip that was not one. Zones around home (``--enclosing-zone``, given
+with their shape) are replayed as the rings they are.
+
 Exit status: 0 when every acceptance check passes, 1 when one fails, 2 when
 there is not enough data for a verdict or the input cannot be used.
 
@@ -99,7 +104,7 @@ def load_core() -> dict[str, ModuleType]:
     spec.loader.exec_module(package)
     return {
         name: importlib.import_module(f"{CORE_PACKAGE}.{name}")
-        for name in ("approach", "geo", "kinematic", "params", "tracker")
+        for name in ("approach", "geo", "homeward", "kinematic", "params", "tracker")
     }
 
 
@@ -369,6 +374,13 @@ def _zone_arg(value: str) -> tuple[float, float, float]:
     return latitude, longitude, radius
 
 
+def _enclosing_arg(value: str) -> tuple[str, tuple[float, float, float] | None]:
+    entity_id, sep, shape = value.partition("=")
+    if not entity_id.startswith("zone."):
+        raise argparse.ArgumentTypeError(f"not a zone entity id: {entity_id!r}")
+    return entity_id, _zone_arg(shape) if sep else None
+
+
 def _existing_file(value: str) -> Path:
     path = Path(value)
     if not path.is_file():
@@ -430,6 +442,11 @@ class PersonResult:
     false_soon: int = 0
     missed_soon: int = 0
     soon_lead_s: list[float] = field(default_factory=list)
+    heading_warning_s: list[float] = field(default_factory=list)
+    """Per scored trip: how long before arrival heading home came on (0: not on)."""
+    heading_false: int = 0
+    """Times heading home came on and ended without an arrival."""
+    heading_false_s: float = 0.0
 
 
 def report_from_row(
@@ -459,11 +476,14 @@ def replay(
     threshold_s: float,
     ignored: frozenset[str],
     enclosing: frozenset[str] = frozenset(),
+    rings: Iterable[Zone] = (),
 ) -> PersonResult:
     """Replay one person's history and score every completed trip."""
     approach = core["approach"]
+    arrived_reason = core["homeward"].HomewardReason.ARRIVED
     tracker_mod = core["tracker"]
-    target = core["kinematic"].Target(zone.latitude, zone.longitude, zone.radius_m)
+    target_cls = core["kinematic"].Target
+    target = target_cls(zone.latitude, zone.longitude, zone.radius_m)
     rows = [r for r in rows if r.state not in ("unknown", "unavailable")]
     result = PersonResult(person, threshold_s, rows=len(rows))
     if not rows:
@@ -473,11 +493,24 @@ def replay(
     config = tracker_mod.TrackerConfig(params, ignored, historical=True)
     trk = tracker_mod.PersonTracker(config, target, at_target=first.in_target)
     trk.set_threshold(threshold_s)
+    trk.set_rings(target_cls(z.latitude, z.longitude, z.radius_m) for z in rings)
 
     trip: list[tuple[float, float, float | None, float | None]] = []
     soon_entries: list[float] = []
     trip_live = False  # only score trips that began inside this export
     last_time = first.timestamp
+    heading_since: float | None = None
+
+    def track_heading(at: float) -> None:
+        nonlocal heading_since
+        homeward = trk.homeward
+        if homeward.heading and heading_since is None:
+            heading_since = at
+        elif not homeward.heading and heading_since is not None:
+            if trip_live and homeward.reason is not arrived_reason:
+                result.heading_false += 1
+                result.heading_false_s += at - heading_since
+            heading_since = None
 
     def on_transition(transition: Any, at: float) -> None:
         nonlocal trip_live
@@ -500,12 +533,15 @@ def replay(
             tick_at < report.timestamp and trk.state is not approach.ApproachState.HOME
         ):
             on_transition(trk.tick(tick_at), tick_at)
+            track_heading(tick_at)
             tick_at += TICK_S
         last_time = report.timestamp
 
         before = trk.state
+        heading_before = heading_since
         update = trk.update(report)
         on_transition(update.transition, report.timestamp)
+        track_heading(report.timestamp)
 
         if update.outcome is not None and update.outcome.accepted and trip_live:
             snap = trk.snapshot(report.timestamp)
@@ -546,6 +582,9 @@ def replay(
                         result.false_soon += 1
                 if before is not approach.ApproachState.ARRIVING_SOON:
                     result.missed_soon += 1
+                result.heading_warning_s.append(
+                    0.0 if heading_before is None else arrival - heading_before
+                )
             trip.clear()
             soon_entries.clear()
             trip_live = False
@@ -618,6 +657,20 @@ def summarise(result: PersonResult) -> Iterator[str]:
             "  lead time when it turned on: median "
             f"{statistics.median(result.soon_lead_s) / 60:.1f} min"
         )
+    warnings = result.heading_warning_s
+    if warnings:
+        on = [w for w in warnings if w > 0]
+        line = f"  heading home: on at arrival in {len(on)} of {len(warnings)} trips"
+        if on:
+            line += (
+                f", for a median {statistics.median(on) / 60:.0f} min before it"
+                f" (10 % under {_quantile(on, 0.1) / 60:.0f})"
+            )
+        yield line
+        yield (
+            f"  heading home that was not: {result.heading_false} times, "
+            f"{result.heading_false_s / 3600:.1f} h in all"
+        )
 
 
 def acceptance(results: list[PersonResult]) -> tuple[list[str], int]:
@@ -680,9 +733,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enclosing-zone",
         action="append",
+        type=_enclosing_arg,
         default=[],
-        help="with --input: a zone that contains the target, e.g. a neighbourhood "
-        "(repeat); with --url these are found automatically",
+        metavar="ZONE[=LATITUDE,LONGITUDE,RADIUS_M]",
+        help="with --input: a zone that contains the target, e.g. a ring around "
+        "home (repeat); with its shape it is replayed for heading home too. "
+        "With --url these are found automatically",
     )
     parser.add_argument(
         "--days", type=_positive, default=10.0, help="days of history to pull"
@@ -757,8 +813,16 @@ def main(argv: list[str] | None = None) -> int:
                 write_private(args.save, json.dumps(minimal_export(rows)))
             zone, all_zones = fetch_zones(base, token, args.zone_entity)
             enclosing = enclosing_zones(core, zone, all_zones)
+            rings = sorted(
+                (z for z in all_zones if z.entity_id in enclosing),
+                key=lambda z: z.entity_id,
+            )
             rerun = [f"--zone {zone.latitude},{zone.longitude},{zone.radius_m:g}"]
-            rerun += [f"--enclosing-zone {z}" for z in sorted(enclosing)]
+            rerun += [
+                f"--enclosing-zone {z.entity_id}={z.latitude},{z.longitude},"
+                f"{z.radius_m:g}"
+                for z in rings
+            ]
             print(f"To re-run on a saved export: {' '.join(rerun)}")
         else:
             rows = parse_export(json.loads(args.input.read_text(encoding="utf-8")))
@@ -770,7 +834,12 @@ def main(argv: list[str] | None = None) -> int:
                 radius,
                 args.zone_entity.removeprefix("zone.").title(),
             )
-            enclosing = frozenset(args.enclosing_zone)
+            enclosing = frozenset(entity_id for entity_id, _ in args.enclosing_zone)
+            rings = [
+                Zone(entity_id, shape[0], shape[1], shape[2], entity_id)
+                for entity_id, shape in args.enclosing_zone
+                if shape is not None
+            ]
     except BacktestError as err:
         print(f"error: {err}", file=sys.stderr)
         return EXIT_NO_VERDICT
@@ -800,6 +869,7 @@ def main(argv: list[str] | None = None) -> int:
             threshold_s=thresholds.get(person, args.threshold_min * 60.0),
             ignored=frozenset(args.ignore_zone),
             enclosing=enclosing,
+            rings=rings,
         )
         for person in persons
     ]
@@ -827,6 +897,11 @@ def main(argv: list[str] | None = None) -> int:
                         "threshold_min": r.threshold_s / 60.0,
                         "false_arriving_soon": r.false_soon,
                         "missed_arriving_soon": r.missed_soon,
+                        "heading_home": {
+                            "warning_s": [round(w, 1) for w in r.heading_warning_s],
+                            "false_starts": r.heading_false,
+                            "false_start_s": round(r.heading_false_s, 1),
+                        },
                         "samples": [
                             {
                                 "distance_m": round(s.distance_m, 1),

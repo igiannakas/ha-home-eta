@@ -56,17 +56,30 @@ from .const import (
     CONF_ENABLE_HISTORICAL,
     CONF_IGNORED_ZONES,
     CONF_MEMBERS,
+    CONF_NEAR_HOME_FADE_AFTER_MIN,
+    CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
     CONF_REFERENCE_ETA_ENTITY,
     CONF_ZONE,
+    DEFAULT_NEAR_HOME_FADE_AFTER_MIN,
+    DEFAULT_NEAR_HOME_RADIUS_M,
     DIAGNOSTICS_COORDINATE_DECIMALS,
     DOMAIN,
     FIX_LOG_SIZE,
+    NEAR_HOME_FADE_MIN,
+    NEAR_HOME_FULL_M,
     SIGNAL_PERSON_UPDATED,
     STORE_VERSION,
     TICK_INTERVAL,
 )
 from .core.approach import ApproachState, Transition
+from .core.homeward import (
+    HomewardReason,
+    HomewardRestore,
+    NearHomeConfig,
+    SpeedSource,
+    near_home,
+)
 from .core.kinematic import Target
 from .core.params import EstimatorParams
 from .core.tracker import (
@@ -117,6 +130,20 @@ def target_from_state(state: State | None) -> Target | None:
     except KeyError, TypeError, ValueError:
         return None
     return Target(latitude, longitude, radius)
+
+
+def near_home_config_from_options(options: Mapping[str, Any]) -> NearHomeConfig:
+    """Build a group's near-home settings from its options."""
+    radius = float(options.get(CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M))
+    fade_after = float(
+        options.get(CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN)
+    )
+    return NearHomeConfig(
+        radius_m=radius,
+        full_m=NEAR_HOME_FULL_M,
+        fade_after_s=None if fade_after == 0 else fade_after * 60.0,
+        fade_s=NEAR_HOME_FADE_MIN * 60.0,
+    )
 
 
 def friendly_name(hass: HomeAssistant, entity_id: str) -> str:
@@ -237,13 +264,15 @@ class PersonRuntime:
             stored = None
 
         person_state = hass.states.get(self.person_id)
-        report = self._report(person_state)
+        enclosing = self._enclosing_zones()
+        report = self._report(person_state, enclosing)
         self._tracker = PersonTracker(
             self.config,
             target,
             stored,
             at_target=report is not None and report.in_target,
         )
+        self._tracker.set_rings(self._rings(enclosing))
         if report is not None:
             # While Home Assistant starts, states carry the restore time, not
             # the time of the fix; after a reload they are genuine.
@@ -315,8 +344,10 @@ class PersonRuntime:
     def _handle_person_event(self, event: Event[EventStateChangedData]) -> None:
         new_state = event.data["new_state"]
         self._set_person_present(new_state is not None)
-        report = self._report(new_state)
+        enclosing = self._enclosing_zones()
+        report = self._report(new_state, enclosing)
         if report is not None and new_state is not None:
+            self.tracker.set_rings(self._rings(enclosing))
             result = self.tracker.update(
                 report, use_for_kinematics=self._kinematics_enabled
             )
@@ -380,20 +411,41 @@ class PersonRuntime:
 
     @callback
     def restore_state(
-        self, state: ApproachState, since: float, last_heard: float
+        self,
+        state: ApproachState | None,
+        since: float,
+        last_heard: float,
+        homeward: HomewardRestore | None = None,
     ) -> None:
-        """Restore the approach state saved before a restart or reload.
+        """Restore the approach state and trip home saved before a restart.
 
-        Only when the person was heard from within the stale period: the
-        silence before the restart counts, so a restored state can never
-        outlive it, however often Home Assistant restarts or reloads.
+        The approach state only when the person was heard from within the
+        stale period: the silence before the restart counts, so a restored
+        state can never outlive it, however often Home Assistant restarts or
+        reloads. A trip home within the longest ETA; the overdue rule then
+        ends it at once if it should have finished by now.
         """
         params = self.config.params
-        age = dt_util.utcnow().timestamp() - last_heard
-        if age > params.stale_after_s or age < -params.clock_step_back_s:
+        now = dt_util.utcnow().timestamp()
+        age = now - last_heard
+        if age < -params.clock_step_back_s:
             return
-        if self.tracker.restore_state(state, since, last_heard):
+        changed = False
+        if (
+            state is not None
+            and age <= params.stale_after_s
+            and self.tracker.restore_state(state, since, last_heard)
+        ):
             _LOGGER.debug("%s: restored approach state %s", self.person_id, state)
+            changed = True
+        if (
+            homeward is not None
+            and age <= params.max_eta_s
+            and self.tracker.restore_homeward(homeward, last_heard, now)
+        ):
+            _LOGGER.debug("%s: restored the trip home", self.person_id)
+            changed = True
+        if changed:
             self._refresh()
 
     async def async_reset_history(self) -> None:
@@ -418,7 +470,16 @@ class PersonRuntime:
 
     # -- internals ---------------------------------------------------------
 
-    def _report(self, state: State | None) -> PersonReport | None:
+    def _enclosing_zones(self) -> list[str]:
+        """Return the zones that contain the target (rings around home)."""
+        return async_get_enclosing_zones(self.hass, self.zone_id)
+
+    def _rings(self, enclosing: list[str]) -> tuple[Target, ...]:
+        """Return the shapes of the enclosing zones."""
+        rings = (target_from_state(self.hass.states.get(zone)) for zone in enclosing)
+        return tuple(ring for ring in rings if ring is not None)
+
+    def _report(self, state: State | None, enclosing: list[str]) -> PersonReport | None:
         if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
             return None
         return build_report(
@@ -427,7 +488,7 @@ class PersonRuntime:
             state.last_updated.timestamp(),
             self.zone_id,
             friendly_name(self.hass, self.zone_id),
-            enclosing_zones=async_get_enclosing_zones(self.hass, self.zone_id),
+            enclosing_zones=enclosing,
         )
 
     @callback
@@ -586,6 +647,31 @@ class Candidate:
 
 
 @dataclass(frozen=True, slots=True)
+class HomewardCandidate:
+    """A member who is heading home."""
+
+    person_id: str
+    name: str
+    arrival: datetime
+    minutes: int
+    reason: HomewardReason
+    speed_source: SpeedSource | None
+    distance_m: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class NearHome:
+    """How near home the nearest member is, and who that is."""
+
+    value: float
+    """0 (far, or staying somewhere for long) to 1 (home or close by)."""
+    person_id: str
+    name: str
+    distance_m: float
+    still_since: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class GroupView:
     """What a group's entities publish."""
 
@@ -596,11 +682,20 @@ class GroupView:
     missing: tuple[str, ...] = ()
     reporting: int = 0
     """Members with data; with none, the group knows nothing."""
+    heading_home: tuple[HomewardCandidate, ...] = ()
+    """Members heading home, the one expected first leading."""
+    near: NearHome | None = None
+    """None when no member's whereabouts are known."""
 
     @property
     def first(self) -> Candidate | None:
         """Return the member due first."""
         return self.candidates[0] if self.candidates else None
+
+    @property
+    def expected_first(self) -> HomewardCandidate | None:
+        """Return the member heading home who is expected first."""
+        return self.heading_home[0] if self.heading_home else None
 
 
 class GroupRuntime:
@@ -612,6 +707,14 @@ class GroupRuntime:
         self.entry = entry
         self.zone_id: str = entry.data[CONF_ZONE]
         self.members: tuple[str, ...] = tuple(entry.options.get(CONF_MEMBERS) or ())
+        try:
+            self.near_config = near_home_config_from_options(entry.options)
+        except (TypeError, ValueError) as err:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_options",
+                translation_placeholders={"error": str(err)},
+            ) from err
         self._listeners: list[CALLBACK_TYPE] = []
         self._unsubscribe: Callable[[], None] | None = None
         self.view = GroupView()
@@ -667,12 +770,16 @@ class GroupRuntime:
     @callback
     def _refresh(self) -> None:
         now = dt_util.utcnow()
+        moment = now.timestamp()
         persons = self.hass.data[DATA_KEY].persons
         candidates: list[Candidate] = []
+        heading: list[HomewardCandidate] = []
         home: list[str] = []
+        home_names: list[str] = []
         soon: list[str] = []
         soon_names: list[str] = []
         missing: list[str] = []
+        near: NearHome | None = None
         for person_id in self.members:
             runtime = persons.get((person_id, self.zone_id))
             if runtime is None or not runtime.view.available:
@@ -684,7 +791,39 @@ class GroupRuntime:
                 continue
             if snapshot.state is ApproachState.HOME:
                 home.append(person_id)
+                home_names.append(runtime.entry.title)
                 continue
+            homeward = snapshot.homeward
+            if (
+                homeward is not None
+                and homeward.heading
+                and homeward.arrival is not None
+            ):
+                arrival = dt_util.utc_from_timestamp(homeward.arrival)
+                heading.append(
+                    HomewardCandidate(
+                        person_id=person_id,
+                        name=runtime.entry.title,
+                        arrival=arrival,
+                        minutes=minutes_until(arrival, now),
+                        reason=homeward.reason,
+                        speed_source=homeward.speed_source,
+                        distance_m=snapshot.distance_m,
+                    )
+                )
+            distance = snapshot.distance_m
+            if homeward is not None and distance is not None:
+                value = near_home(
+                    distance, homeward.still_since, moment, self.near_config
+                )
+                if near is None or (value, -distance) > (near.value, -near.distance_m):
+                    near = NearHome(
+                        value,
+                        person_id,
+                        runtime.entry.title,
+                        distance,
+                        homeward.still_since,
+                    )
             if snapshot.state is ApproachState.ARRIVING_SOON:
                 soon.append(person_id)
                 soon_names.append(runtime.entry.title)
@@ -702,6 +841,10 @@ class GroupRuntime:
                     )
                 )
         candidates.sort(key=lambda c: (c.arrival, c.person_id))
+        heading.sort(key=lambda c: (c.arrival, c.person_id))
+        if home:
+            # Someone is home: as near as it gets.
+            near = NearHome(1.0, home[0], home_names[0], 0.0, None)
         self.view = GroupView(
             candidates=tuple(candidates),
             persons_home=tuple(home),
@@ -709,6 +852,8 @@ class GroupRuntime:
             arriving_soon_names=tuple(soon_names),
             missing=tuple(missing),
             reporting=len(self.members) - len(missing),
+            heading_home=tuple(heading),
+            near=near,
         )
         for update in list(self._listeners):
             update()
@@ -732,6 +877,32 @@ class GroupRuntime:
             "persons_home": list(view.persons_home),
             "arriving_soon": list(view.arriving_soon),
             "missing": list(view.missing),
+            "heading_home": [
+                {
+                    "person": c.person_id,
+                    "arrival": c.arrival.isoformat(),
+                    "minutes": c.minutes,
+                    "reason": c.reason.value,
+                    "speed_source": None
+                    if c.speed_source is None
+                    else c.speed_source.value,
+                }
+                for c in view.heading_home
+            ],
+            "near_home": None
+            if view.near is None
+            else {
+                "value": round(view.near.value, 3),
+                "person": view.near.person_id,
+                "distance_m": round(view.near.distance_m),
+                "still_since": view.near.still_since,
+            },
+            "near_home_config": {
+                "radius_m": self.near_config.radius_m,
+                "full_m": self.near_config.full_m,
+                "fade_after_s": self.near_config.fade_after_s,
+                "fade_s": self.near_config.fade_s,
+            },
         }
 
 
