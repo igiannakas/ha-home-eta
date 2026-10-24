@@ -59,7 +59,7 @@ It lasts until they get home, or until the trip clearly is not one: they stay at
 
 ### Expected home
 
-The distance over a speed. With few reports, the speed is the typical door-to-door speed for a trip home of that length (walking under 1 km, a local drive at a few kilometres, 9-11 m/s for 15-35 km, motorway speeds at 100 km), sharpened by the speed measured between rings or by the closing speed: the two are blended, so one fast stretch of motorway or one queue does not swing it. Close and slow is walking, and the measured speed is used as it is. The estimate only changes with a new report; between reports the minutes count down, and the expected time never falls in the past.
+The distance over a speed. With few reports, the speed is the typical door-to-door speed for a trip home of that length (walking under 1 km, a local drive at a few kilometres, 9-11 m/s for 15-35 km, motorway speeds at 100 km), sharpened by the speed measured between rings or by the closing speed: the two are blended, so one fast stretch of motorway or one queue does not swing it. Close and slow is walking, and the measured speed is used as it is. Close and at vehicle speed is the end of a drive: it is blended with that, about 4.5 m/s door to door with the junctions and parking, not with walking pace. The estimate only changes with a new report; between reports the minutes count down, and the expected time never falls in the past.
 
 ### Arriving soon
 

@@ -65,6 +65,19 @@ m/s by car, ~11 by train); 100 km is mostly motorway.
 VEHICLE_MIN_SPEED_MPS = 1.0
 """Floor on a measured speed before it is blended with the typical one."""
 
+VEHICLE_TYPICAL_MIN_MPS = 4.5
+"""Floor on the typical speed to blend with when travelling faster than walking.
+
+The table is the typical speed for a trip home of a given length, whatever
+the means; under a few kilometres most of those are walked. Someone measured
+at vehicle speed is not walking the last kilometre: their typical speed is
+that of the last stretch of a drive, junctions and parking included. Eight
+drives' first or last 1-2 km from home (16-24 Oct 2026) closed at 2.2 to
+8.9 m/s, 4.6 m/s on average (geometric, as the blend is). Without this, a car
+1 km out at 6-10 m/s was expected home at about 3 m/s, 2-3 minutes late. It
+applies within about 3 km, where the table is slower than this.
+"""
+
 
 class HomewardReason(StrEnum):
     """Why heading home started or ended."""
@@ -280,7 +293,8 @@ def trip_speed_mps(
     A measured speed alone over-trusts one leg (a stretch of motorway, a queue);
     the typical speed alone ignores how this trip is going. Close and slow is
     on foot, which is steady, so the measurement is used directly. Otherwise
-    the two are blended geometrically.
+    the two are blended geometrically; at vehicle speed, with no less than the
+    typical speed at the end of a drive.
     """
     typical = typical_speed_mps(distance_m)
     if measured_mps is None or measured_mps <= params.homeward_min_speed_mps:
@@ -290,6 +304,8 @@ def trip_speed_mps(
         and distance_m < params.on_foot_max_distance_m
     ):
         return max(measured_mps, params.on_foot_min_speed_mps), SpeedSource.ON_FOOT
+    if measured_mps >= params.on_foot_max_speed_mps:
+        typical = max(typical, VEHICLE_TYPICAL_MIN_MPS)
     return (
         math.sqrt(max(measured_mps, VEHICLE_MIN_SPEED_MPS) * typical),
         SpeedSource.MEASURED,

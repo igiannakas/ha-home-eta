@@ -9,6 +9,7 @@ import pytest
 from custom_components.home_eta.core.geo import haversine_m
 from custom_components.home_eta.core.homeward import (
     TYPICAL_SPEED_MPS,
+    VEHICLE_TYPICAL_MIN_MPS,
     HomewardReason,
     HomewardRestore,
     HomewardStay,
@@ -100,6 +101,26 @@ def test_trip_speed_rules() -> None:
     # Fast: blended, so one fast stretch does not promise an early arrival.
     speed, _ = trip_speed_mps(30_000, 30.0, P)
     assert typical_speed_mps(30_000) < speed < 30.0
+
+
+def test_a_vehicle_near_home_is_not_expected_at_walking_pace() -> None:
+    """Regression: a car 1 km out at 6.5 m/s was expected at 2.9 m/s."""
+    speed, source = trip_speed_mps(1_000, 6.5, P)
+    assert source is SpeedSource.MEASURED
+    assert speed == pytest.approx(math.sqrt(6.5 * VEHICLE_TYPICAL_MIN_MPS))
+    # Beyond a local drive the table is already at least that fast.
+    assert typical_speed_mps(5_000) >= VEHICLE_TYPICAL_MIN_MPS
+    for distance in (5_000, 15_000, 60_000):
+        speed, _ = trip_speed_mps(distance, 8.0, P)
+        assert speed == pytest.approx(math.sqrt(8.0 * typical_speed_mps(distance)))
+
+
+@pytest.mark.parametrize("distance", [400, 1_000, 2_000, 2_999, 3_000, 4_000, 8_000])
+def test_closing_faster_never_expects_a_later_arrival(distance: float) -> None:
+    """Above barely closing (no measurement: the typical speed), across modes."""
+    measured = [P.homeward_min_speed_mps + i / 20 for i in range(1, 800)]
+    speeds = [trip_speed_mps(distance, m, P)[0] for m in measured]
+    assert speeds == sorted(speeds)
 
 
 # -- near home ---------------------------------------------------------------
