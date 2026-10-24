@@ -2,6 +2,7 @@
   "domain": "home_eta",
   "name": "Home ETA",
   "codeowners": ["@igiannakas"],
+  "after_dependencies": ["recorder"],
   "config_flow": true,
   "dependencies": ["person", "zone"],
   "documentation": "https://github.com/igiannakas/ha-home-eta",
@@ -9,5 +10,5 @@
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/igiannakas/ha-home-eta/issues",
   "requirements": [],
-  "version": "2.1.2"
+  "version": "2.2.0"
 }

@@ -6,6 +6,9 @@
         "state": { "on": "mdi:home-account" }
       }
     },
+    "button": {
+      "relearn_typical_speeds": { "default": "mdi:database-refresh-outline" }
+    },
     "number": {
       "arriving_soon_threshold": { "default": "mdi:timer-cog-outline" }
     },
@@ -22,7 +25,8 @@
           "heading_home": "mdi:home-import-outline",
           "home": "mdi:home"
         }
-      }
+      },
+      "typical_speeds": { "default": "mdi:speedometer" }
     }
   }
 }

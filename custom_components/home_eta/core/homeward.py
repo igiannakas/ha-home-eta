@@ -16,7 +16,9 @@ questions:
   is the typical one for a journey home of that length (walking under 1 km, a
   local drive at a few kilometres, a motorway at 100 km), sharpened by what
   was measured: the ring-to-ring speed, or the filtered closing speed. Slow
-  and close means on foot, and the measured speed is used as it is.
+  and close means on foot, and the measured speed is used as it is. The
+  typical speeds are learned from the person's own trips home
+  (``core/calibration.py``): each completed trip is handed over for that.
 - **Is the person arriving soon?** On a trip home, once the expected arrival
   is within the person's threshold or they are within 800 m, unless they are
   inside another zone (a shop near home). It then stays on until the trip
@@ -39,44 +41,25 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from itertools import pairwise
 import math
 
+from .calibration import (
+    MIN_ELAPSED_S,
+    MIN_REMAINING_M,
+    LearnedTrip,
+    TripSample,
+    make_trip,
+)
 from .geo import haversine_m, is_valid_coordinate
 from .kinematic import Fix, Target
 from .params import DEFAULT_ARRIVING_SOON_MIN, EstimatorParams
+from .speeds import BUILT_IN_CURVES, SpeedCurves
 
-TYPICAL_SPEED_MPS: tuple[tuple[float, float], ...] = (
-    (300.0, 1.2),
-    (1_000.0, 1.3),
-    (2_000.0, 3.0),
-    (5_000.0, 6.0),
-    (15_000.0, 9.0),
-    (35_000.0, 11.0),
-    (100_000.0, 20.0),
-)
-"""Typical door-to-door closing speed for a trip home from a straight-line distance.
+SAMPLE_INTERVAL_S = 60.0
+"""Fixes of a trip home are kept for learning at most once a minute..."""
 
-Interpolated on log distance. Under ~1 km people walk; a few kilometres is a
-local drive with parking; 15-35 km is London by train or car (measured 4.7-9.6
-m/s by car, ~11 by train); 100 km is mostly motorway.
-"""
-
-VEHICLE_MIN_SPEED_MPS = 1.0
-"""Floor on a measured speed before it is blended with the typical one."""
-
-VEHICLE_TYPICAL_MIN_MPS = 4.5
-"""Floor on the typical speed to blend with when travelling faster than walking.
-
-The table is the typical speed for a trip home of a given length, whatever
-the means; under a few kilometres most of those are walked. Someone measured
-at vehicle speed is not walking the last kilometre: their typical speed is
-that of the last stretch of a drive, junctions and parking included. Eight
-drives' first or last 1-2 km from home (16-24 Oct 2026) closed at 2.2 to
-8.9 m/s, 4.6 m/s on average (geometric, as the blend is). Without this, a car
-1 km out at 6-10 m/s was expected home at about 3 m/s, 2-3 minutes late. It
-applies within about 3 km, where the table is slower than this.
-"""
+MAX_TRIP_SAMPLES = 360
+"""...and at most this many (the latest), six hours' worth."""
 
 
 class HomewardReason(StrEnum):
@@ -249,6 +232,17 @@ class _Fix:
 
 
 @dataclass(frozen=True, slots=True)
+class _Sample:
+    """A fix on the way home, kept to learn typical speeds from on arrival."""
+
+    t: float
+    distance_m: float
+    measured_mps: float | None
+    """The speed measured then (between rings, or closing), if any: the one
+    the expected arrival was worked out with."""
+
+
+@dataclass(frozen=True, slots=True)
 class HomewardState:
     """Everything a fix can change, to undo it as a glitch."""
 
@@ -271,45 +265,45 @@ class HomewardState:
     soon: bool
     threshold_s: float
     """The threshold ``soon`` was judged with."""
-
-
-def typical_speed_mps(distance_m: float) -> float:
-    """Return the typical closing speed for a trip home from ``distance_m``."""
-    table = TYPICAL_SPEED_MPS
-    if distance_m <= table[0][0]:
-        return table[0][1]
-    for (d0, v0), (d1, v1) in pairwise(table):
-        if distance_m <= d1:
-            f = (math.log(distance_m) - math.log(d0)) / (math.log(d1) - math.log(d0))
-            return v0 + (v1 - v0) * f
-    return table[-1][1]
+    samples: tuple[_Sample, ...]
 
 
 def trip_speed_mps(
-    distance_m: float, measured_mps: float | None, params: EstimatorParams
+    distance_m: float,
+    measured_mps: float | None,
+    params: EstimatorParams,
+    curves: SpeedCurves = BUILT_IN_CURVES,
 ) -> tuple[float, SpeedSource]:
     """Return the speed to expect for the rest of the trip home, and its source.
 
     A measured speed alone over-trusts one leg (a stretch of motorway, a queue);
     the typical speed alone ignores how this trip is going. Close and slow is
     on foot, which is steady, so the measurement is used directly. Otherwise
-    the two are blended geometrically; at vehicle speed, with no less than the
-    typical speed at the end of a drive.
+    the two are blended, ``measured ** w * typical ** (1 - w)``, with the
+    typical speed and weight learned for that distance; at driving speed,
+    those for driving. Above barely closing, closing faster never means a
+    later arrival: at driving speed, never slower than just below it
+    (walking near home, or a slow drive further out).
     """
-    typical = typical_speed_mps(distance_m)
     if measured_mps is None or measured_mps <= params.homeward_min_speed_mps:
-        return typical, SpeedSource.TYPICAL
-    if (
-        measured_mps < params.on_foot_max_speed_mps
-        and distance_m < params.on_foot_max_distance_m
-    ):
-        return max(measured_mps, params.on_foot_min_speed_mps), SpeedSource.ON_FOOT
-    if measured_mps >= params.on_foot_max_speed_mps:
-        typical = max(typical, VEHICLE_TYPICAL_MIN_MPS)
-    return (
-        math.sqrt(max(measured_mps, VEHICLE_MIN_SPEED_MPS) * typical),
-        SpeedSource.MEASURED,
+        return curves.typical_mps(distance_m, driving=False), SpeedSource.TYPICAL
+    driving_from = params.on_foot_max_speed_mps
+    near = distance_m < params.on_foot_max_distance_m
+    if measured_mps < driving_from:
+        if near:
+            speed = max(measured_mps, params.on_foot_min_speed_mps)
+            return speed, SpeedSource.ON_FOOT
+        return (
+            curves.expected_mps(measured_mps, distance_m, driving=False),
+            SpeedSource.MEASURED,
+        )
+    below = (
+        max(driving_from, params.on_foot_min_speed_mps)
+        if near
+        else curves.expected_mps(driving_from, distance_m, driving=False)
     )
+    speed = curves.expected_mps(measured_mps, distance_m, driving=True)
+    return max(speed, below), SpeedSource.MEASURED
 
 
 class HomewardTracker:
@@ -366,6 +360,11 @@ class HomewardTracker:
         self._restored_heard: float | None = None
         """When the person was last heard before a restart (no fix this run yet)."""
         self._restored_distance_m: float | None = None
+        self._curves: SpeedCurves = BUILT_IN_CURVES
+        self._samples: tuple[_Sample, ...] = ()
+        """Fixes of the trip home in progress, to learn typical speeds from
+        when the person gets home."""
+        self._completed: list[LearnedTrip] = []
 
     # -- state -----------------------------------------------------------
 
@@ -393,6 +392,16 @@ class HomewardTracker:
     def threshold_s(self) -> float:
         """Return the arriving-soon threshold in seconds."""
         return self._threshold_s
+
+    @property
+    def speed_curves(self) -> SpeedCurves:
+        """Return the typical speeds the expected arrival is worked out with."""
+        return self._curves
+
+    def take_completed_trips(self) -> list[LearnedTrip]:
+        """Return the trips home completed since last asked, to learn from."""
+        trips, self._completed = self._completed, []
+        return trips
 
     def restore_data(self) -> HomewardRestore | None:
         """Return what to save for a restart: a trip home, or a stay."""
@@ -444,6 +453,7 @@ class HomewardTracker:
             closest_m=self._closest_m,
             soon=self._soon,
             threshold_s=self._threshold_s,
+            samples=self._samples,
         )
 
     def load(self, saved: HomewardState) -> None:
@@ -464,6 +474,7 @@ class HomewardTracker:
         self._reason = saved.reason
         self._since = saved.since
         self._closest_m = saved.closest_m
+        self._samples = saved.samples
         # The threshold is not a fix's to undo; an arriving soon judged with
         # an earlier one is judged afresh.
         self._soon = saved.soon and saved.threshold_s == self._threshold_s
@@ -486,6 +497,7 @@ class HomewardTracker:
             "inward_crossings": [list(c) for c in self._inward],
             "zones_inside": len(self._inside),
             "zones": len(self._rings),
+            "trip_samples": len(self._samples),
         }
 
     # -- configuration ---------------------------------------------------
@@ -534,6 +546,23 @@ class HomewardTracker:
         self._judged &= kept
         self._spent &= kept
         self._trigger &= kept
+
+    def set_speed_curves(self, curves: SpeedCurves) -> None:
+        """Use these typical speeds from the next fix on.
+
+        The speed worked out at the last fix stands until then. Only a trip
+        restored after a restart, with no fix yet, uses the new typical
+        speed at once (it has no speed of its own until a fix).
+        """
+        self._curves = curves
+
+    def discard_samples(self) -> None:
+        """Forget what was kept of the trip home in progress, to learn from.
+
+        What happens at a restart (it is not saved), for a replay of the
+        recorder's history to do the same.
+        """
+        self._samples = ()
 
     def restore(
         self, data: HomewardRestore, last_heard: float, distance_m: float | None
@@ -597,7 +626,14 @@ class HomewardTracker:
     # -- input -----------------------------------------------------------
 
     def arrive(self, t: float) -> None:
-        """The person is home."""
+        """The person is home: the trip home is handed over to learn from."""
+        if not self._home:
+            last_time = self._last_time()
+            if last_time is not None and last_time - t > self._p.clock_step_back_s:
+                # The clock stepped back since the last fix: how long the rest
+                # of the trip took is unknown, so it is not learned from.
+                self._samples = ()
+            self._complete_trip(t)
         self._clear_trip()
         self._home = True
         if self._heading:
@@ -702,6 +738,11 @@ class HomewardTracker:
         self._last = fix
         self._trip_speed = self._speed_at(t, distance_m, speed_mps)
         self._evaluate(t, speed_mps, entered=entered, left_trigger=left_trigger)
+        ring = self._ring_speed(t)
+        self._keep_sample(
+            _Sample(t, distance_m, speed_mps if ring is None else ring),
+            crossing=bool(entered),
+        )
 
     def tick(self, now: float, speed_mps: float | None) -> None:
         """Re-evaluate the time-driven rules."""
@@ -805,6 +846,7 @@ class HomewardTracker:
         self._closest_m = distance
         self._trigger = frozenset()
         self._soon = False
+        self._samples = ()
 
     def _end(self, reason: HomewardReason, now: float) -> None:
         self._heading = False
@@ -813,6 +855,46 @@ class HomewardTracker:
         self._closest_m = None
         self._trigger = frozenset()
         self._soon = False
+        # Arriving hands the trip over first; any other end is not a trip home.
+        self._samples = ()
+
+    def _keep_sample(self, sample: _Sample, *, crossing: bool) -> None:
+        """Keep a fix of the trip home, to learn typical speeds from on arrival.
+
+        Only while heading home, which is when the expected arrival is used:
+        time spent going out, wandering about or visiting is not travel home.
+        A trip home that ends other than by arriving (a stay, turning back,
+        going quiet) drops what was kept. At most one fix a minute (fixes can
+        come every few seconds), plus every zone crossing.
+        """
+        samples = self._samples
+        if not self._heading:
+            self._samples = ()
+        elif not samples or crossing or sample.t - samples[-1].t >= SAMPLE_INTERVAL_S:
+            self._samples = (*samples, sample)[-MAX_TRIP_SAMPLES:]
+
+    def _complete_trip(self, arrived_at: float) -> None:
+        """Hand over the trip home just completed: the speed achieved from each fix.
+
+        From each kept fix, the time actually taken to the edge of the zone.
+        Fixes close to the edge, or just before arriving, are left out: there
+        the timing of the reports says more than the journey.
+        """
+        p = self._p
+        radius = self._target.radius_m
+        samples: list[TripSample] = []
+        for sample in self._samples:
+            remaining = sample.distance_m - radius
+            elapsed = arrived_at - sample.t
+            if remaining < MIN_REMAINING_M or elapsed < MIN_ELAPSED_S:
+                continue
+            speed = remaining / elapsed
+            if speed > p.max_plausible_speed_mps:
+                continue
+            samples.append(TripSample(sample.distance_m, speed, sample.measured_mps))
+        trip = make_trip(arrived_at, samples)
+        if trip is not None:
+            self._completed.append(trip)
 
     def _shift_times(self, delta: float) -> None:
         """Move every stored time by ``delta`` (after the clock stepped back)."""
@@ -829,6 +911,9 @@ class HomewardTracker:
         self._since = shift(self._since)
         self._restored_heard = shift(self._restored_heard)
         self._inward = tuple((t + delta, d) for t, d in self._inward)
+        self._samples = tuple(
+            replace(sample, t=sample.t + delta) for sample in self._samples
+        )
 
     def _clear_trip(self) -> None:
         self._last = None
@@ -843,6 +928,7 @@ class HomewardTracker:
         self._trigger = frozenset()
         self._inward = ()
         self._trip_speed = None
+        self._samples = ()
         self._restored_heard = self._restored_distance_m = None
 
     def _distance(self) -> float | None:
@@ -919,11 +1005,11 @@ class HomewardTracker:
         """Return the speed to expect from a fix at ``t``, and its source."""
         ring = self._ring_speed(t)
         if ring is not None:
-            speed, source = trip_speed_mps(distance_m, ring, self._p)
+            speed, source = trip_speed_mps(distance_m, ring, self._p, self._curves)
             if source is SpeedSource.MEASURED:
                 source = SpeedSource.ZONE_CROSSINGS
             return speed, source
-        return trip_speed_mps(distance_m, speed_mps, self._p)
+        return trip_speed_mps(distance_m, speed_mps, self._p, self._curves)
 
     def _expected_speed(self) -> tuple[float, SpeedSource] | None:
         """Return the speed behind the estimate (typical after a restart)."""
@@ -932,7 +1018,7 @@ class HomewardTracker:
         distance = self._distance()
         if distance is None:
             return None
-        return typical_speed_mps(distance), SpeedSource.TYPICAL
+        return self._curves.typical_mps(distance, driving=False), SpeedSource.TYPICAL
 
     def _raw_arrival(self) -> float | None:
         """Return the expected arrival, which may be in the past."""

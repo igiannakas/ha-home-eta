@@ -565,3 +565,48 @@ def test_pull_requires_token_and_person(
         backtest.main(["--url", "http://ha.test:8123"])
     with pytest.raises(SystemExit):
         backtest.main(["--url", "ftp://ha.test", "--person", PERSON])
+
+
+def test_typical_speeds_are_learned_from_the_other_trips(
+    backtest: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, result = run(backtest, tmp_path, [journeys(8)])
+    assert code == backtest.EXIT_PASS
+    out = capsys.readouterr().out
+    assert "typical speeds learned from the other trips" in out
+    assert "typical speeds learned from 8 trips home" in out
+    assert result[PERSON]["speeds"] == "learned"
+    assert result[PERSON]["trips_learned"] == 8
+
+
+def test_built_in_speeds_can_be_replayed(
+    backtest: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, result = run(backtest, tmp_path, [journeys(8)], "--speeds", "built-in")
+    assert code == backtest.EXIT_PASS
+    out = capsys.readouterr().out
+    assert "built-in typical speeds" in out
+    assert "learned from" not in out
+    assert result[PERSON]["speeds"] == "built-in"
+    assert result[PERSON]["trips_learned"] == 0
+
+
+def test_a_trip_is_never_scored_with_what_it_taught(backtest: ModuleType) -> None:
+    core = backtest.load_core()
+    calibration = core["calibration"]
+    params = core["params"].EstimatorParams()
+
+    def trip(at: float, speed: float) -> Any:
+        return calibration.make_trip(
+            at, [calibration.TripSample(15_000.0, speed, speed)]
+        )
+
+    learned = [trip(T0, 9.0), trip(T0 + 86_400, 20.0), trip(T0 + 2 * 86_400, 9.0)]
+    # Leaving home before the fast trip: it is left out, the others kept.
+    curves = backtest._curves_without_next(core, learned, T0 + 3_600, params)
+    others = calibration.fit([learned[0], learned[2]], T0 + 3_600, params)
+    assert curves == others.curves
+    assert curves.typical_mps(15_000, driving=True) == pytest.approx(9.0)
+    # After the last trip home, everything learned is used.
+    curves = backtest._curves_without_next(core, learned, T0 + 3 * 86_400, params)
+    assert curves == calibration.fit(learned, T0 + 3 * 86_400, params).curves

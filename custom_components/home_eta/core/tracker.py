@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from .calibration import LearnedTrip
 from .geo import haversine_m, is_valid_coordinate
 from .homeward import (
     HomewardRestore,
@@ -23,6 +24,10 @@ from .homeward import (
 )
 from .kinematic import Fix, FixOutcome, FixVerdict, KinematicEstimator, Target
 from .params import EstimatorParams
+from .speeds import SpeedCurves
+
+REPLAY_TICK_S = 60.0
+"""How often the integration re-evaluates between reports (its minute tick)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +158,18 @@ class PersonTracker:
     def set_threshold(self, seconds: float) -> None:
         """Set the arriving-soon threshold (applied at the next tick or fix)."""
         self._homeward.set_threshold(seconds)
+
+    def set_speed_curves(self, curves: SpeedCurves) -> None:
+        """Set the typical speeds of a trip home (applied from the next fix)."""
+        self._homeward.set_speed_curves(curves)
+
+    def take_completed_trips(self) -> list[LearnedTrip]:
+        """Return the trips home completed since last asked, to learn from."""
+        return self._homeward.take_completed_trips()
+
+    def discard_trip_samples(self) -> None:
+        """Forget what was kept of the trip home in progress (as a restart does)."""
+        self._homeward.discard_samples()
 
     def set_target(self, target: Target, now: float) -> None:
         """Move the target (the zone was edited).
@@ -382,6 +399,57 @@ def build_report(
         latitude=number("latitude"),
         longitude=number("longitude"),
         accuracy_m=number("gps_accuracy"),
+    )
+
+
+def learn_trips(
+    reports: Iterable[PersonReport],
+    target: Target,
+    config: TrackerConfig,
+    *,
+    rings: Iterable[Target] = (),
+    tick_s: float = REPLAY_TICK_S,
+) -> list[LearnedTrip]:
+    """Replay a person's recorded reports; return the trips home they completed.
+
+    As the integration runs: the same tracker, ticked every ``tick_s``
+    between reports while the person is away. A report that repeats the
+    previous one exactly is Home Assistant writing the person's last state
+    again as it restarts: it is not a fix, and what was kept of a trip home
+    in progress is dropped, as a restart drops it. A restart while the
+    person moved cannot be told from the recorder alone, so the replay keeps
+    learning through it where the integration would have started afresh.
+    """
+    rings = tuple(rings)
+    tracker: PersonTracker | None = None
+    previous: PersonReport | None = None
+    trips: list[LearnedTrip] = []
+    for report in sorted(reports, key=lambda report: report.timestamp):
+        if previous is not None and _same_news(previous, report):
+            if tracker is not None:
+                tracker.discard_trip_samples()
+            continue
+        if tracker is None:
+            tracker = PersonTracker(config, target, at_target=report.in_target)
+            tracker.set_rings(rings)
+        elif previous is not None:
+            tick = previous.timestamp + tick_s
+            while tick < report.timestamp and not tracker.at_home:
+                tracker.tick(tick)
+                tick += tick_s
+        tracker.update(report)
+        trips.extend(tracker.take_completed_trips())
+        previous = report
+    return trips
+
+
+def _same_news(a: PersonReport, b: PersonReport) -> bool:
+    return (
+        a.in_target == b.in_target
+        and a.other_zones == b.other_zones
+        and a.latitude == b.latitude
+        and a.longitude == b.longitude
+        and a.accuracy_m == b.accuracy_m
     )
 
 

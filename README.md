@@ -16,6 +16,8 @@ For each person (entity IDs shown for a person called "person"):
 | `number.person_arriving_soon_threshold` | Minutes out that count as arriving soon (default 15). |
 | `sensor.person_distance_to_home` | Straight-line distance to the zone centre; 0 at home. |
 | `sensor.person_near_home` | How near home they are, 0-100 %, whichever way they are going: 100 % at home or within 800 m, 0 % at their near-home radius (3 km by default). It fades to 0 % after a long stay at one place. |
+| `sensor.person_typical_speeds` | How many trips home the person's typical speeds were learned from (see below). Attributes: the two learned tables, and what each of the latest trips changed in them. Diagnostic. |
+| `button.person_relearn_typical_speeds` | Learn the typical speeds afresh from the recorder's history. |
 
 For a group (named "Home ETA" by default):
 
@@ -27,7 +29,7 @@ For a group (named "Home ETA" by default):
 | `binary_sensor.home_eta_someone_arriving_soon` | On while any member is arriving soon by their own threshold. Its `persons` and `names` attributes say who; unknown while nobody is and a member has no data. |
 | `sensor.home_eta_near_home` | The highest near home of any member, each by their own radius and fade (so not always the nearest member); 100 % while anyone is home. Attributes: who that is and their distance, and who is home. |
 
-All but the threshold are unknown until the person's first location arrives.
+All but the threshold and the typical speeds are unknown until the person's first location arrives.
 
 The status is one stage of the way home at a time, most home first:
 
@@ -59,7 +61,20 @@ It lasts until they get home, or until the trip clearly is not one: they stay at
 
 ### Expected home
 
-The distance over a speed. With few reports, the speed is the typical door-to-door speed for a trip home of that length (walking under 1 km, a local drive at a few kilometres, 9-11 m/s for 15-35 km, motorway speeds at 100 km), sharpened by the speed measured between rings or by the closing speed: the two are blended, so one fast stretch of motorway or one queue does not swing it. Close and slow is walking, and the measured speed is used as it is. Close and at vehicle speed is the end of a drive: it is blended with that, about 4.5 m/s door to door with the junctions and parking, not with walking pace. The estimate only changes with a new report; between reports the minutes count down, and the expected time never falls in the past.
+The distance over a speed. With no measured speed, the speed is the typical door-to-door speed for a trip home of that length, learned from the person's own trips (below). With one (between rings, or the closing speed), the two are blended, `measured ^ w × typical ^ (1 - w)`, so one fast stretch of motorway or one queue does not swing it; `w` is learned too, and starts at 0.5. Close and slow is walking, and the measured speed is used as it is. At driving speed the typical speed and weight for driving are used. Once someone is clearly closing (above 0.3 m/s), closing faster never means a later expected arrival. The estimate only changes with a new report; between reports the minutes count down, and the expected time never falls in the past.
+
+### Typical speeds, learned
+
+The built-in values are a starting point: walking under 1 km, a local drive at a few kilometres, 9-11 m/s for 15-35 km, motorway speeds at 100 km; when driving, at least 4.5 m/s door to door (the end of a drive, junctions and parking included); and a measured speed worth half. Each person's own trips home then correct them, at each distance in the tables, for any trip and when driving:
+
+- **What is learned from**: every trip home that ends at home. At each position report while heading home, the distance, the speed actually achieved from there to the edge of the zone, and the speed measured then. Time spent going out, wandering about or visiting is not travel home: a trip home that ends without arriving (a stay, turning back, going quiet) is dropped. Reports close to the edge, or in the last minute, are left out. Reports measured at driving speed (2.5 m/s or more) teach the driving table.
+- **The typical speed**: a correction factor moves the built-in speed towards the speeds achieved there. Each trip counts once, a report at most three times faster or slower than built in. The built-in speed counts as three trips, so one trip moves it a little and a handful most of the way. Learned speeds never fall with distance, and driving is never slower than any trip; to keep to that, a distance never travelled can be pulled along by its neighbours (fast short drives raise the longer distances to match), so its `trips` can be 0 while its speed has moved.
+- **The weight of a measured speed**: each trip counts for the weight that would have predicted it best, from 0 (the typical speed knew better) to 1 (the measurement did), the more the further its measured speeds were from the typical one (however many reports it had). A report counts as at most three times faster or slower than typical, measured or achieved, which limits what one glitch can do. The built-in 0.5 counts as three trips. A fast stretch before the slower roads near home, say, makes the measured speed count for less there.
+- **Ageing**: a trip's weight halves every 60 days, so a new routine or road works are picked up; trips are forgotten after about 11 months. The tables are refitted daily as trips age.
+- **When**: as each trip home ends. When a person is first set up (and at the first start after upgrading), the trips home in the recorder's history are learned from too, up to 60 days back (the recorder keeps 10 by default). **Relearn typical speeds** replaces what was learned with what the history holds now; it refuses without the recorder, and says so when the history cannot be read. Moving the zone further than its radius forgets what was learned around the old place, also when it moved while Home Assistant was off.
+- **What is kept**: in Home Assistant's storage, up to 200 trips, 30 reports each: distances to 10 m, speeds to 0.01 m/s, and arrival times to the minute; no coordinates but the zone's own centre and radius, to notice it moving. Learning works from exactly that, so a restart does not change what was learned. Removing the person removes them.
+
+`sensor.person_typical_speeds` shows the tables. Each row of its `all_trips` and `driving` attributes is one distance: `built_in_mps`, `learned_mps`, the `factor` between them, the weight of the `trips` behind it (after ageing), `measured_weight` and the `weight_trips` behind that. `recent_trips` lists the latest five trips, newest first, each with where it was first sampled (`from_m`), how many reports were kept (`samples`) and what learning it changed, as it was then: per distance, the `factor` and `measured_weight` before and after. `fitted_at` is when the tables were last fitted. The sensor's state is the number of trips learned from, so its history shows when it learned; its attributes are recorded with it.
 
 ### Arriving soon
 
@@ -94,6 +109,8 @@ For the house it was built for, simulated on 15 everyday absences and three phon
 
 On the household's own trips of 16-23 October 2026, heading home came on 41 and 109 minutes before the two arrivals from London, and arriving soon never came on early. On a drive back from London on 24 October it came on 34 minutes ahead, and the expected arrival was within 3 minutes over the last ten minutes.
 
+On those trips (16-24 October; four and three trips home learned from, mostly in the same car), each scored with what was learned from all the others, the learned values made the worst estimates better and the typical ones about as good: the 90th-percentile error fell at every distance for both people (5-20 km from 39.6 to 31.1 and from 38.5 to 36.3 minutes, beyond 20 km from 64.9 to 49.9 and from 36.3 to 33.6), while the mean error over every scored report went from 18.1 to 17.2 minutes for one and from 21.3 to 22.5 for the other, whose trips included the one with a long jam (the measured speed was right there, and the other trips had taught it to count for less). What was learned fits the household: driving about 4.5 m/s near home, as built in; any trip faster under 2 km (most trips home there were drives); a measured speed worth less than half (0.3-0.45) between 3 and 35 km, where the road just driven is faster than the road ahead. With so few trips they are still pulled towards the built-in 0.5: a trip counts towards them by how far its measured speeds were from the typical one, not by how many reports it had.
+
 ## Install
 
 1. In HACS, add `https://github.com/igiannakas/ha-home-eta` as a custom repository of type **Integration**, then install **Home ETA**.
@@ -115,6 +132,10 @@ Renaming a person or a zone is followed automatically. Removing a person takes t
 On iPhones, make sure the Companion app has location set to **Always** with background refresh on.
 
 ## Upgrading
+
+### From 2.1
+
+Each person gains `sensor.person_typical_speeds` and `button.person_relearn_typical_speeds`. At the first start after upgrading, the trips home in the recorder's history are learned from in the background, and the expected arrival uses what was learned from then on. Nothing to set up.
 
 ### From 2.0
 
@@ -200,7 +221,7 @@ actions:
 
 ## Check it against your own history
 
-`scripts/backtest.py` replays recorder history through the integration's own code, minute by minute, and reports: for heading home, how long before each arrival it came on and how often it came on for a trip that was not one; for expected home, how far off it was, by distance; and for arriving soon, its lead time and how often it came on far too early (over twice the threshold) or not at all. It needs Python 3.11 or later and nothing else:
+`scripts/backtest.py` replays recorder history through the integration's own code, minute by minute, and reports: for heading home, how long before each arrival it came on and how often it came on for a trip that was not one; for expected home, how far off it was, by distance; and for arriving soon, its lead time and how often it came on far too early (over twice the threshold) or not at all. The typical speeds are learned from the history's trips home as the integration learns them, and each trip is replayed with what was learned from all the others, so no trip learns from itself; the learned tables are printed. `--speeds built-in` replays with the built-in speeds instead. It needs Python 3.11 or later and nothing else:
 
 ```bash
 HA_TOKEN=<long-lived access token> python3 scripts/backtest.py \

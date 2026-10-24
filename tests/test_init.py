@@ -150,6 +150,13 @@ async def test_diagnostics(
     assert fix["latitude"] == round(fix["latitude"], 2)
     assert fix["longitude"] == round(fix["longitude"], 2)
     assert runtime["tracker"]["homeward"]["heading"] is True
+    assert runtime["tracker"]["homeward"]["trip_samples"] >= 1
+    speeds = runtime["typical_speeds"]
+    assert speeds["trips"] == 0
+    assert speeds["history_learned"] is False  # no recorder
+    assert speeds["learn_after"] is None
+    assert [knot["factor"] for knot in speeds["all_trips"]] == [1.0] * 7
+    assert [knot["weight"] for knot in speeds["driving"]] == [0.5] * 8
 
     data = await get_diagnostics_for_config_entry(hass, hass_client, group)
     assert data["runtime"]["members"] == [ALEX]

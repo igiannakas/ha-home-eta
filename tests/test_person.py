@@ -32,7 +32,9 @@ MINUTES = "sensor.alex_minutes_to_home"
 DISTANCE = "sensor.alex_distance_to_home"
 NEAR = "sensor.alex_near_home"
 THRESHOLD = "number.alex_arriving_soon_threshold"
-ALL = (STATUS, EXPECTED, MINUTES, DISTANCE, NEAR, THRESHOLD)
+SPEEDS = "sensor.alex_typical_speeds"
+RELEARN = "button.alex_relearn_typical_speeds"
+ALL = (STATUS, EXPECTED, MINUTES, DISTANCE, NEAR, THRESHOLD, SPEEDS, RELEARN)
 
 pytestmark = pytest.mark.usefixtures("zones")
 
@@ -101,6 +103,8 @@ async def test_entities_created(hass: HomeAssistant) -> None:
     assert device is not None
     assert device.name == "Alex"
     assert registry.async_get(THRESHOLD).entity_category == "config"
+    assert registry.async_get(RELEARN).entity_category == "config"
+    assert registry.async_get(SPEEDS).entity_category == "diagnostic"
 
 
 async def test_status_follows_the_trip(

@@ -30,7 +30,7 @@ from .const import (
     ENTRY_TYPE_PERSON,
 )
 from .migration import async_migrate_entry, async_remove_retired, legacy_store
-from .runtime import DATA_KEY, GroupRuntime, HomeEtaData, PersonRuntime
+from .runtime import DATA_KEY, GroupRuntime, HomeEtaData, PersonRuntime, speeds_store
 
 __all__ = ["async_migrate_entry"]
 
@@ -40,7 +40,7 @@ _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-PERSON_PLATFORMS = [Platform.NUMBER, Platform.SENSOR]
+PERSON_PLATFORMS = [Platform.BUTTON, Platform.NUMBER, Platform.SENSOR]
 GROUP_PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 ISSUES = ("person_missing", "zone_missing", "group_no_members")
@@ -111,6 +111,8 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     # An entry from before 2.0 that was never set up again (disabled, say)
     # still has its learned trips: they are location history, so they go.
     await legacy_store(hass, entry.entry_id).async_remove()
+    # So do the trips its typical speeds were learned from.
+    await speeds_store(hass, entry.entry_id).async_remove()
 
 
 def _references(entry: ConfigEntry) -> set[str]:

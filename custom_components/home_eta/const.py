@@ -52,6 +52,18 @@ TICK_INTERVAL: Final = timedelta(seconds=60)
 FIX_LOG_SIZE: Final = 20
 DIAGNOSTICS_COORDINATE_DECIMALS: Final = 2
 
+# Typical speeds learned from each person's trips home
+SPEEDS_STORE_VERSION: Final = 1
+SPEEDS_SAVE_DELAY_S: Final = 30.0
+SPEEDS_REFIT_INTERVAL_S: Final = 86_400.0
+"""Learned typical speeds are refitted daily: older trips count for less."""
+HISTORY_LOOKBACK: Final = timedelta(days=60)
+"""How far back the recorder's history is learned from (it keeps 10 days by
+default; all of it is used when it keeps more)."""
+RELEARN_KEEP_S: Final = 600.0
+"""Relearning keeps trips learned this recently: the recorder may not have
+written their last states yet."""
+
 SIGNAL_PERSON_UPDATED: Final = f"{DOMAIN}_person_updated_{{zone}}"
 """Dispatcher signal, formatted with the zone entity id."""
 
@@ -63,3 +75,5 @@ KEY_MINUTES: Final = "minutes_to_home"
 KEY_DISTANCE: Final = "distance_to_home"
 KEY_NEAR_HOME: Final = "near_home"
 KEY_SOMEONE_SOON: Final = "someone_arriving_soon"
+KEY_TYPICAL_SPEEDS: Final = "typical_speeds"
+KEY_RELEARN_SPEEDS: Final = "relearn_typical_speeds"

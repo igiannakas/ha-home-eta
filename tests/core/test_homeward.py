@@ -8,8 +8,6 @@ import pytest
 
 from custom_components.home_eta.core.geo import haversine_m
 from custom_components.home_eta.core.homeward import (
-    TYPICAL_SPEED_MPS,
-    VEHICLE_TYPICAL_MIN_MPS,
     HomewardReason,
     HomewardRestore,
     HomewardStay,
@@ -19,10 +17,14 @@ from custom_components.home_eta.core.homeward import (
     SpeedSource,
     near_home,
     trip_speed_mps,
-    typical_speed_mps,
 )
 from custom_components.home_eta.core.kinematic import Fix, Target
 from custom_components.home_eta.core.params import EstimatorParams
+from custom_components.home_eta.core.speeds import (
+    TYPICAL_SPEED_MPS,
+    VEHICLE_TYPICAL_MIN_MPS,
+    typical_speed_mps,
+)
 from tests.sim import HOME_LAT, HOME_LON, T0, TARGET, to_latlon
 
 P = EstimatorParams()

@@ -65,6 +65,11 @@
         }
       }
     },
+    "button": {
+      "relearn_typical_speeds": {
+        "name": "Relearn typical speeds"
+      }
+    },
     "number": {
       "arriving_soon_threshold": {
         "name": "Arriving soon threshold"
@@ -180,12 +185,51 @@
             }
           }
         }
+      },
+      "typical_speeds": {
+        "name": "Typical speeds",
+        "unit_of_measurement": "trips",
+        "state_attributes": {
+          "all_trips": {
+            "name": "All trips"
+          },
+          "driving": {
+            "name": "Driving"
+          },
+          "first_trip": {
+            "name": "First trip"
+          },
+          "fitted_at": {
+            "name": "Fitted"
+          },
+          "half_life_days": {
+            "name": "Half-life"
+          },
+          "learned_from_history": {
+            "name": "Learned from history"
+          },
+          "prior_trips": {
+            "name": "Built-in weight"
+          },
+          "recent_trips": {
+            "name": "Recent trips"
+          }
+        }
       }
     }
   },
   "exceptions": {
     "invalid_options": {
       "message": "Invalid options: {error}"
+    },
+    "relearn_interrupted": {
+      "message": "Home ETA was reloaded or stopped while relearning typical speeds. Press Relearn again."
+    },
+    "relearn_no_recorder": {
+      "message": "The recorder is not set up, so there is no history to relearn typical speeds from. What was learned is kept."
+    },
+    "relearn_unreadable": {
+      "message": "The recorder's history could not be read, so typical speeds were not relearned. What was learned is kept; see the log."
     },
     "zone_not_ready": {
       "message": "Zone {zone} is not available yet."

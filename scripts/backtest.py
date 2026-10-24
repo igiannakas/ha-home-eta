@@ -11,6 +11,11 @@ integration's own code, with its minute tick. Three things are scored:
 - Arriving soon: how long before arrival it came on, how often far too early
   (over twice the threshold), and arrivals it missed.
 
+The typical speeds are learned from the export's trips home, as the
+integration learns them, and each trip is replayed with what was learned
+from all the others: a trip never learns from itself. The learned tables are
+printed. ``--speeds built-in`` replays with the built-in tables instead.
+
 Pull straight from Home Assistant (the token is read from HA_TOKEN):
 
     HA_TOKEN=... python3 scripts/backtest.py --url http://homeassistant.local:8123 \
@@ -33,13 +38,15 @@ Only the Python standard library (3.11 or later) is needed; no Home Assistant.
 Known difference from the live integration: after a Home Assistant restart the
 recorder stores the person's last position again, stamped with the restart
 time. The integration does not use those as fixes until Home Assistant has
-started; a recorder export does not mark them, so they are replayed as fixes.
+started; a recorder export does not mark them, so they are replayed as fixes
+(learning typical speeds skips them, as the integration does when it learns
+from the recorder's history).
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime, timedelta
 import email.message
@@ -110,7 +117,15 @@ def load_core() -> dict[str, ModuleType]:
     spec.loader.exec_module(package)
     return {
         name: importlib.import_module(f"{CORE_PACKAGE}.{name}")
-        for name in ("geo", "homeward", "kinematic", "params", "tracker")
+        for name in (
+            "calibration",
+            "geo",
+            "homeward",
+            "kinematic",
+            "params",
+            "speeds",
+            "tracker",
+        )
     }
 
 
@@ -472,6 +487,31 @@ def report_from_row(
     )
 
 
+def learn_trips(
+    core: dict[str, ModuleType],
+    rows: list[Row],
+    zone: Zone,
+    *,
+    params: Any,
+    enclosing: frozenset[str] = frozenset(),
+    rings: Iterable[Zone] = (),
+) -> list[Any]:
+    """Return the trips home the integration would learn typical speeds from."""
+    target_cls = core["kinematic"].Target
+    reports = [
+        report_from_row(core, row, zone, enclosing)
+        for row in rows
+        if row.state not in ("unknown", "unavailable")
+    ]
+    trips: list[Any] = core["tracker"].learn_trips(
+        reports,
+        target_cls(zone.latitude, zone.longitude, zone.radius_m),
+        core["tracker"].TrackerConfig(params),
+        rings=[target_cls(z.latitude, z.longitude, z.radius_m) for z in rings],
+    )
+    return trips
+
+
 def replay(
     core: dict[str, ModuleType],
     person: str,
@@ -482,8 +522,13 @@ def replay(
     threshold_s: float,
     enclosing: frozenset[str] = frozenset(),
     rings: Iterable[Zone] = (),
+    learned: Sequence[Any] | None = None,
 ) -> PersonResult:
-    """Replay one person's history and score every completed trip."""
+    """Replay one person's history and score every completed trip.
+
+    With ``learned`` trips, each outing is replayed with the typical speeds
+    learned from all of them but the one it ends with.
+    """
     arrived_reason = core["homeward"].HomewardReason.ARRIVED
     tracker_mod = core["tracker"]
     target_cls = core["kinematic"].Target
@@ -536,6 +581,10 @@ def replay(
         was_home = trk.at_home
         heading_before = heading_since
         soon_before = soon
+        if learned is not None and was_home and not report.in_target:
+            trk.set_speed_curves(
+                _curves_without_next(core, learned, report.timestamp, params)
+            )
         outcome = trk.update(report)
         if was_home and not trk.at_home:
             trip.clear()
@@ -578,6 +627,20 @@ def replay(
             soon_entries.clear()
             trip_live = False
     return result
+
+
+def _curves_without_next(
+    core: dict[str, ModuleType],
+    learned: Sequence[Any],
+    departed_at: float,
+    params: Any,
+) -> Any:
+    """Return the typical speeds learned from all but the next trip home."""
+    calibration = core["calibration"]
+    following = [t for t in learned if t.arrived_at > departed_at]
+    next_arrival = min((t.arrived_at for t in following), default=None)
+    others = [t for t in learned if t.arrived_at != next_arrival]
+    return calibration.fit(others, departed_at, params).curves
 
 
 # -- reporting ---------------------------------------------------------------
@@ -656,6 +719,32 @@ def summarise(result: PersonResult) -> Iterator[str]:
             f"  heading home that was not: {result.heading_false} times, "
             f"{result.heading_false_s / 3600:.1f} h in all"
         )
+
+
+def speed_lines(
+    core: dict[str, ModuleType], trips: Sequence[Any], params: Any
+) -> Iterator[str]:
+    """Yield the typical speeds learned from ``trips``, as of the last one."""
+    now = max((t.arrived_at for t in trips), default=0.0)
+    calibration = core["calibration"].fit(trips, now, params)
+    yield f"  typical speeds learned from {len(trips)} trips home (m/s, weight of"
+    yield "  a measured speed):"
+    yield (
+        f"    {'distance':>9}  {'all trips: built-in learned':>27} {'weight':>6}"
+        f"  {'driving: built-in learned':>25} {'weight':>6}"
+    )
+    driving = {k.distance_m: k for k in calibration.driving.knots}
+    every = {k.distance_m: k for k in calibration.all_trips.knots}
+    for distance in sorted(driving):
+        cells = []
+        for knot, width in ((every.get(distance), 27), (driving[distance], 25)):
+            cells.append(
+                f"{knot.built_in_mps:>{width - 14}.1f} {knot.learned_mps:5.1f} "
+                f"x{knot.factor:4.2f} {knot.weight:6.2f}"
+                if knot is not None
+                else f"{'':>{width + 7}}"
+            )
+        yield f"    {distance / 1000:>7.1f} km  {cells[0]}  {cells[1]}"
 
 
 def acceptance(results: list[PersonResult]) -> tuple[list[str], int]:
@@ -755,6 +844,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="tracking parameter as set in Advanced, e.g. stale_after_s=1200",
     )
+    parser.add_argument(
+        "--speeds",
+        choices=("learned", "built-in"),
+        default="learned",
+        help="typical speeds: learned from the other trips (default) or built in",
+    )
     parser.add_argument("--json", type=Path, help="write per-fix results here")
     return parser
 
@@ -838,6 +933,13 @@ def main(argv: list[str] | None = None) -> int:
         if person not in persons:
             _warn(f"--person-threshold {person}: not among the people replayed")
 
+    learned = {
+        person: learn_trips(
+            core, rows[person], zone, params=params, enclosing=enclosing, rings=rings
+        )
+        for person in persons
+        if args.speeds == "learned"
+    }
     results = [
         replay(
             core,
@@ -848,6 +950,7 @@ def main(argv: list[str] | None = None) -> int:
             threshold_s=thresholds.get(person, args.threshold_min * 60.0),
             enclosing=enclosing,
             rings=rings,
+            learned=learned.get(person),
         )
         for person in persons
     ]
@@ -858,10 +961,18 @@ def main(argv: list[str] | None = None) -> int:
                 "significant_changes_only=0 so position updates are included"
             )
 
-    print(f"Target {zone.entity_id}, radius {zone.radius_m:g} m")
+    speeds = (
+        "typical speeds learned from the other trips"
+        if args.speeds == "learned"
+        else "built-in typical speeds"
+    )
+    print(f"Target {zone.entity_id}, radius {zone.radius_m:g} m; {speeds}")
     for result in results:
         for line in summarise(result):
             print(line)
+        if result.person in learned:
+            for line in speed_lines(core, learned[result.person], params):
+                print(line)
     lines, status = acceptance(results)
     for line in lines:
         print(line)
@@ -872,6 +983,8 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     r.person: {
                         "trips": r.trips,
+                        "speeds": args.speeds,
+                        "trips_learned": len(learned.get(r.person, ())),
                         "threshold_min": r.threshold_s / 60.0,
                         "false_arriving_soon": r.false_soon,
                         "missed_arriving_soon": r.missed_soon,
