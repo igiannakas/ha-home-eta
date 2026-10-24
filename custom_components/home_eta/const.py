@@ -56,8 +56,7 @@ SIGNAL_PERSON_UPDATED: Final = f"{DOMAIN}_person_updated_{{zone}}"
 """Dispatcher signal, formatted with the zone entity id."""
 
 # Entity keys (also translation keys and unique-id suffixes)
-KEY_HEADING_HOME: Final = "heading_home"
-KEY_ARRIVING_SOON: Final = "arriving_soon"
+KEY_STATUS: Final = "status"
 KEY_THRESHOLD: Final = "arriving_soon_threshold"
 KEY_EXPECTED_HOME: Final = "expected_home"
 KEY_MINUTES: Final = "minutes_to_home"

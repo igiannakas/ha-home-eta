@@ -10,10 +10,9 @@ For each person (entity IDs shown for a person called "person"):
 
 | Entity | What it shows |
 | --- | --- |
-| `binary_sensor.person_heading_home` | On from early in the trip home until arrival. Attributes: why it last came on or went off and since when, the speed behind the expected arrival and where it came from, and the farthest distance since the person last stayed somewhere. |
+| `sensor.person_status` | `home`, `arriving_soon`, `heading_home` or `away` (see below). Attributes: why the trip home last started or ended and when, the speed behind the expected arrival and where it came from, and the farthest distance since the person last stayed somewhere. |
 | `sensor.person_expected_home` | When they are expected home, while heading home; unknown otherwise. |
 | `sensor.person_minutes_to_home` | Minutes until then. |
-| `binary_sensor.person_arriving_soon` | On once they are heading home and expected within their threshold, or within 800 m. It stays on until they get home or the trip home ends, and is held off while they are inside another zone. |
 | `number.person_arriving_soon_threshold` | Minutes out that count as arriving soon (default 15). |
 | `sensor.person_distance_to_home` | Straight-line distance to the zone centre; 0 at home. |
 | `sensor.person_near_home` | How near home they are, 0-100 %, whichever way they are going: 100 % at home or within 800 m, 0 % at their near-home radius (3 km by default). It fades to 0 % after a long stay at one place. |
@@ -22,12 +21,24 @@ For a group (named "Home ETA" by default):
 
 | Entity | What it shows |
 | --- | --- |
+| `sensor.home_eta_status` | The most-home status of any member: `home` while anyone is home, else `arriving_soon` if anyone is, and so on. Attributes list the members in each status (`persons_home`, `persons_arriving_soon`, `persons_heading_home`, `persons_away`) and any member without data. |
 | `sensor.home_eta_expected_home` | When the first member heading home is expected; unknown while nobody is. Attributes: who that is, everyone heading home with their expected time, who is home, and any member without data. |
 | `sensor.home_eta_minutes_to_home` | Minutes until then. |
 | `binary_sensor.home_eta_someone_arriving_soon` | On while any member is arriving soon by their own threshold. Its `persons` and `names` attributes say who; unknown while no member has data. |
-| `sensor.home_eta_near_home` | The nearest member's near home; 100 % while anyone is home. |
+| `sensor.home_eta_near_home` | The nearest member's near home (each by their own radius and fade); 100 % while anyone is home. Attributes: who that is and their distance, and who is home. |
 
-All of them are unknown until the person's first location arrives.
+All but the threshold are unknown until the person's first location arrives.
+
+The status is one stage of the way home at a time, most home first:
+
+| Status | When |
+| --- | --- |
+| `home` | In the destination zone. |
+| `arriving_soon` | Heading home and expected within the threshold, or within 800 m. Held off inside another zone. |
+| `heading_home` | On the way home, not yet arriving soon. |
+| `away` | Anything else: out, staying somewhere, or going the other way. |
+
+A short trip home, or a fast one, can go from `away` straight to `arriving_soon`. For "the trip home has started", trigger on leaving `away` for either of the two (see Automations).
 
 ## How it works
 
@@ -42,7 +53,7 @@ Every position report from the phone gives a straight-line distance to the zone.
 
 ### Heading home
 
-`binary_sensor.person_heading_home` comes on when the person has come at least 20 % (and 500 m) closer than the farthest point since they last stayed somewhere, and is still closing; or the moment they enter a zone around home (see rings below). That is scale-invariant: 500 m on a walk back from town, a few kilometres on a drive back from a friend's, 7 km on the way back from central London. Driving round to park, or walking about somewhere far away, is not mistaken for it.
+The status becomes `heading_home` when the person has come at least 20 % (and 500 m) closer than the farthest point since they last stayed somewhere, and is still closing; or the moment they enter a zone around home (see rings below). That is scale-invariant: 500 m on a walk back from town, a few kilometres on a drive back from a friend's, 7 km on the way back from central London. Driving round to park, or walking about somewhere far away, is not mistaken for it.
 
 It stays on until they get home, or until the trip clearly is not one: they stay at one place for 20 minutes (a quiet phone counts: a still report, then silence; so do indoor positions bouncing a few hundred metres), they move back out beyond the closest point by 500 m or 15 % of the distance, whichever is more, they leave the zone around home that started it, or their phone goes silent well past the expected arrival. Each zone around home starts a trip home once per outing, so a road along a zone's edge does not keep restarting it. Trips home and stays are kept across restarts.
 
@@ -52,7 +63,7 @@ The distance over a speed. With few reports, the speed is the typical door-to-do
 
 ### Arriving soon
 
-On a trip home, arriving soon comes on once the expected arrival is within the person's threshold or they are within 800 m of the zone centre (**Arriving-soon distance** in Advanced). Once on it stays on until they get home or the trip home ends, so an estimate that wobbles around the threshold does not switch it on and off. Inside any zone other than home it is held off (a shop near home is not arriving home); zones that contain home, such as the rings, do not count. Changing the threshold judges it afresh.
+On a trip home, the status becomes `arriving_soon` once the expected arrival is within the person's threshold or they are within 800 m of the zone centre (**Arriving-soon distance** in Advanced). It stays so until they get home or the trip home ends, so an estimate that wobbles around the threshold does not switch it back and forth. Inside any zone other than home it is held off (a shop near home is not arriving home); zones that contain home, such as the rings, do not count. Changing the threshold judges it afresh.
 
 ### Near home
 
@@ -103,15 +114,22 @@ Renaming a person or a zone is followed automatically. Removing a person takes t
 
 On iPhones, make sure the Companion app has location set to **Always** with background refresh on.
 
-## Upgrading from 1.x
+## Upgrading
+
+### From 2.0
+
+Each person's heading-home and arriving-soon binary sensors are now the states `heading_home` and `arriving_soon` of `sensor.person_status`, which also says `home` and `away`. The binary sensors are removed on upgrade; in an automation, `binary_sensor.person_heading_home` being on becomes the status being `heading_home` or `arriving_soon`, and arriving soon being on becomes the status being `arriving_soon`. The threshold now lives only on its number entity (the `threshold_min` attribute is gone). A group gains `sensor.home_eta_status`. A trip home in progress, or a stay somewhere, during the upgrade restart is not carried over, so near home may stay high for up to another 90 minutes for someone already staying near home.
+
+### From 1.x
 
 Version 2.0 keeps only what turned out to be useful, and per person:
 
 - **Removed**: the kinematic and past-trips ETAs, closing speed, ETA confidence, the approach state, and the group's first-arrival sensors. Their entities are deleted on upgrade. Use expected home, minutes to home and arriving soon instead; they now exist for each person as well as for the group.
-- **Arriving soon** now follows heading home and expected home, so it always agrees with minutes to home.
+- **Arriving soon** now follows heading home and expected home: it comes on when minutes to home reaches the threshold (or within 800 m) and stays on until the trip home ends.
 - **Learning from past trips** is gone: learned trips are deleted on upgrade, and so are the `reset_history` and `export_history` actions.
 - **Options**: the activity, reference travel-time and "zones that end a trip" options are gone, and so is **Slowest closing speed** in Advanced. A group's near-home radius and fade move to each of its members.
-- A trip home in progress during the upgrade restart is not carried over.
+- **Attributes** gone with them: heading home's `expected_at` and `minutes` (now sensors of their own) and `staying_since` (now on near home); the group expected home's `minutes`, `reason`, `speed_source` and `distance_m`, and each member's `reason` and `speed_source` (on the person's own entities now); the group near home's `staying_since`, `radius_m` and `fade_after_min` (on each person's near home now).
+- A trip home in progress, or a stay somewhere, during the upgrade restart is not carried over.
 
 ## Automations
 
@@ -134,7 +152,19 @@ actions:
       preset_mode: comfort
 ```
 
-Go back to away when the trip home turns out not to be one: `sensor.home_eta_minutes_to_home` becomes unknown while nobody is home. For one person, use their own `sensor.person_minutes_to_home` and `binary_sensor.person_heading_home` instead.
+Go back to away when the trip home turns out not to be one: the group's status goes back to `away`. For one person, use their own `sensor.person_minutes_to_home` and `sensor.person_status` instead.
+
+Do something as soon as a person sets off home, however short the trip:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: sensor.person_status
+    from: away
+    to:
+      - heading_home
+      - arriving_soon
+```
 
 Keep the house a little warmer while anyone is close by:
 

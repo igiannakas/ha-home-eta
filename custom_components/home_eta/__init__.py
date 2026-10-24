@@ -29,7 +29,7 @@ from .const import (
     ENTRY_TYPE_GROUP,
     ENTRY_TYPE_PERSON,
 )
-from .migration import async_migrate_entry, legacy_store
+from .migration import async_migrate_entry, async_remove_retired, legacy_store
 from .runtime import DATA_KEY, GroupRuntime, HomeEtaData, PersonRuntime
 
 __all__ = ["async_migrate_entry"]
@@ -40,7 +40,7 @@ _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-PERSON_PLATFORMS = [Platform.BINARY_SENSOR, Platform.NUMBER, Platform.SENSOR]
+PERSON_PLATFORMS = [Platform.NUMBER, Platform.SENSOR]
 GROUP_PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 ISSUES = ("person_missing", "zone_missing", "group_no_members")
@@ -60,6 +60,7 @@ def _platforms(entry: ConfigEntry) -> list[Platform]:
 
 async def async_setup_entry(hass: HomeAssistant, entry: HomeEtaConfigEntry) -> bool:
     """Set up a person or a group."""
+    await async_remove_retired(hass, entry)
     runtime: PersonRuntime | GroupRuntime
     if entry.data[CONF_ENTRY_TYPE] == ENTRY_TYPE_PERSON:
         runtime = PersonRuntime(hass, entry)

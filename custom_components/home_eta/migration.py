@@ -1,6 +1,6 @@
 """Upgrade config entries saved by earlier versions.
 
-Version 1.2 (Home ETA 2.0) keeps only what turned out to be useful:
+Version 1.2 (Home ETA 2.0.0) keeps only what turned out to be useful:
 
 - The kinematic and past-trips ETAs, closing speed, ETA confidence, approach
   state and the first-arrival sensors are gone; their registry entries are
@@ -12,9 +12,18 @@ Version 1.2 (Home ETA 2.0) keeps only what turned out to be useful:
 - Near home is measured per person now: a group's radius and fade move to
   each of its members.
 
+Version 1.3 (Home ETA 2.1.0) puts heading home and arriving soon into one
+status sensor per person (home, arriving soon, heading home, away); their
+binary sensors are removed from the registry.
+
 Each entry is migrated on its own, in whatever order Home Assistant sets them
-up, so a group hands its near-home settings to members not yet migrated, and
-a person not yet handed any looks them up in a group not yet migrated.
+up, so a group hands near-home settings to members not yet migrated, and a
+person not yet handed any looks them up: both pick the same group (by title)
+when a person is in several.
+
+Retired entities and learned trips are removed at every setup rather than
+only when migrating, so an entry set up by an older release in between (a
+downgrade, then an upgrade) is cleaned up too.
 """
 
 from __future__ import annotations
@@ -49,7 +58,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 CONFIG_VERSION = 1
-CONFIG_MINOR_VERSION = 2
+CONFIG_MINOR_VERSION = 3
 
 LEGACY_PERSON_OPTIONS = (
     "activity_entity",
@@ -70,6 +79,8 @@ LEGACY_GROUP_ENTITIES = (
     "first_arrival_person",
     "first_arrival_minutes",
 )
+REPLACED_BY_STATUS = ("heading_home", "arriving_soon")
+"""Person binary sensors of 1.2, now states of the status sensor."""
 LEGACY_STORE_VERSION = 1
 
 
@@ -88,15 +99,29 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Saved by a newer release (then downgraded): minor versions are
         # backwards compatible.
         return True
-    if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_GROUP:
-        _migrate_group(hass, entry)
-    else:
-        _migrate_person(hass, entry)
-        # After the entry is updated, so another entry's migration running
-        # meanwhile sees this one as done.
-        await legacy_store(hass, entry.entry_id).async_remove()
-    _LOGGER.info("Migrated %s to version 1.2", entry.title)
+    group = entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_GROUP
+    if entry.minor_version < 2:
+        if group:
+            _migrate_group(hass, entry)
+        else:
+            _migrate_person(hass, entry)
+    if entry.minor_version < 3:
+        hass.config_entries.async_update_entry(entry, minor_version=3)
+    _LOGGER.info("Migrated %s to version 1.%s", entry.title, CONFIG_MINOR_VERSION)
     return True
+
+
+async def async_remove_retired(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove what earlier releases made and this one does not provide.
+
+    Entities no longer provided, and a person's learned trips (location
+    history). Cheap, and a no-op once done.
+    """
+    if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_GROUP:
+        _remove_entities(hass, entry, LEGACY_GROUP_ENTITIES)
+        return
+    _remove_entities(hass, entry, LEGACY_PERSON_ENTITIES + REPLACED_BY_STATUS)
+    await legacy_store(hass, entry.entry_id).async_remove()
 
 
 @callback
@@ -116,29 +141,27 @@ def _migrate_person(hass: HomeAssistant, entry: ConfigEntry) -> None:
     if CONF_NEAR_HOME_RADIUS_M not in options:
         # Not handed settings by a group migrated earlier: look for one.
         options.update(_near_home_options(_legacy_group_options(hass, entry)))
-    _remove_entities(hass, entry, LEGACY_PERSON_ENTITIES)
-    hass.config_entries.async_update_entry(
-        entry, options=options, minor_version=CONFIG_MINOR_VERSION
-    )
+    hass.config_entries.async_update_entry(entry, options=options, minor_version=2)
 
 
 @callback
 def _migrate_group(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    near = _near_home_options(entry.options)
     members = set(entry.options.get(CONF_MEMBERS) or [])
     for person in _legacy_person_entries(hass, entry.data.get(CONF_ZONE)):
         if (
             person.data.get(CONF_PERSON) in members
             and CONF_NEAR_HOME_RADIUS_M not in person.options
         ):
+            # The group the person's own migration would pick: this one, or
+            # another not yet migrated whose title comes first.
+            near = _near_home_options(_legacy_group_options(hass, person))
             hass.config_entries.async_update_entry(
                 person, options={**person.options, **near}
             )
-    _remove_entities(hass, entry, LEGACY_GROUP_ENTITIES)
     hass.config_entries.async_update_entry(
         entry,
         options={CONF_MEMBERS: list(entry.options.get(CONF_MEMBERS) or [])},
-        minor_version=CONFIG_MINOR_VERSION,
+        minor_version=2,
     )
 
 
@@ -149,7 +172,7 @@ def _legacy_person_entries(hass: HomeAssistant, zone: object) -> list[ConfigEntr
         if other.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_PERSON
         and other.data.get(CONF_ZONE) == zone
         and other.version == CONFIG_VERSION
-        and other.minor_version < CONFIG_MINOR_VERSION
+        and other.minor_version < 2
     ]
 
 
@@ -162,7 +185,7 @@ def _legacy_group_options(hass: HomeAssistant, entry: ConfigEntry) -> Mapping[st
             for other in hass.config_entries.async_entries(DOMAIN)
             if other.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_GROUP
             and other.data.get(CONF_ZONE) == zone
-            and other.minor_version < CONFIG_MINOR_VERSION
+            and other.minor_version < 2
             and person in (other.options.get(CONF_MEMBERS) or [])
         ),
         key=lambda other: (other.title, other.entry_id),

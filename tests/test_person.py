@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from freezegun.api import FrozenDateTimeFactory
-from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import CoreState, HomeAssistant, State
 from homeassistant.helpers import (
     device_registry as dr,
@@ -26,16 +26,28 @@ from custom_components.home_eta.const import (
 )
 from tests.helpers import ALEX, person_entry, set_person, step
 
-HEADING = "binary_sensor.alex_heading_home"
-SOON = "binary_sensor.alex_arriving_soon"
+STATUS = "sensor.alex_status"
 EXPECTED = "sensor.alex_expected_home"
 MINUTES = "sensor.alex_minutes_to_home"
 DISTANCE = "sensor.alex_distance_to_home"
 NEAR = "sensor.alex_near_home"
 THRESHOLD = "number.alex_arriving_soon_threshold"
-ALL = (HEADING, SOON, EXPECTED, MINUTES, DISTANCE, NEAR, THRESHOLD)
+ALL = (STATUS, EXPECTED, MINUTES, DISTANCE, NEAR, THRESHOLD)
 
 pytestmark = pytest.mark.usefixtures("zones")
+
+
+ON_THE_WAY = ("heading_home", "arriving_soon")
+
+
+def heading(hass: HomeAssistant) -> bool:
+    """Return True while the status says heading home (arriving soon included)."""
+    return hass.states.get(STATUS).state in ON_THE_WAY
+
+
+def soon(hass: HomeAssistant) -> bool:
+    """Return True while the status says arriving soon."""
+    return hass.states.get(STATUS).state == "arriving_soon"
 
 
 async def setup_person(hass: HomeAssistant, **kwargs: object) -> None:
@@ -72,8 +84,8 @@ async def test_entities_created(hass: HomeAssistant) -> None:
 
     for entity_id in ALL:
         assert hass.states.get(entity_id) is not None, entity_id
-    assert hass.states.get(HEADING).state == STATE_OFF
-    assert hass.states.get(SOON).state == STATE_OFF
+    assert not heading(hass)
+    assert not soon(hass)
     assert hass.states.get(EXPECTED).state == STATE_UNKNOWN
     assert hass.states.get(MINUTES).state == STATE_UNKNOWN
     assert hass.states.get(DISTANCE).state == "0"
@@ -91,6 +103,46 @@ async def test_entities_created(hass: HomeAssistant) -> None:
     assert registry.async_get(THRESHOLD).entity_category == "config"
 
 
+async def test_status_follows_the_trip(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    set_person(hass, ALEX, None, zones=("zone.home",))
+    await setup_person(hass)
+    state = hass.states.get(STATUS)
+    assert state.state == "home"
+    assert state.attributes["options"] == [
+        "home",
+        "arriving_soon",
+        "heading_home",
+        "away",
+    ]
+    assert state.attributes["reason"] == "initial"
+    # With 15 minutes this drive would go from away straight to arriving soon.
+    await hass.services.async_call(
+        "number", "set_value", {"entity_id": THRESHOLD, "value": 5}, blocking=True
+    )
+
+    seen: list[str] = []
+
+    def note() -> None:
+        current = hass.states.get(STATUS).state
+        if not seen or seen[-1] != current:
+            seen.append(current)
+
+    for east in [780.0 * i for i in range(1, 14)]:
+        await step(hass, freezer, ALEX, east)
+        note()
+    for east in [10_140.0 - 780.0 * i for i in range(1, 13)]:
+        await step(hass, freezer, ALEX, east)
+        note()
+    await step(hass, freezer, ALEX, None, zones=("zone.home",))
+    note()
+    assert seen == ["away", "heading_home", "arriving_soon", "home"]
+    state = hass.states.get(STATUS)
+    assert state.attributes["reason"] == "arrived"
+    assert dt_util.parse_datetime(state.attributes["since"]) == dt_util.utcnow()
+
+
 async def test_drive_home(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
     set_person(hass, ALEX, None, zones=("zone.home",))
     await setup_person(hass)
@@ -100,7 +152,7 @@ async def test_drive_home(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -
 
     # Out to 10 km at 13 m/s: not heading home.
     await drive(hass, freezer, [780.0 * i for i in range(1, 14)])
-    assert hass.states.get(HEADING).state == STATE_OFF
+    assert not heading(hass)
     assert hass.states.get(EXPECTED).state == STATE_UNKNOWN
     assert hass.states.get(MINUTES).state == STATE_UNKNOWN
     assert int(hass.states.get(DISTANCE).state) == pytest.approx(10_140, abs=50)
@@ -108,14 +160,14 @@ async def test_drive_home(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -
 
     # Back 21 %: heading home, expected in a while.
     await drive(hass, freezer, [9_400.0, 8_620.0, 7_840.0])
-    assert hass.states.get(HEADING).state == STATE_ON
+    assert heading(hass)
     expected = dt_util.parse_datetime(hass.states.get(EXPECTED).state)
     assert expected is not None
     remaining = (expected - dt_util.utcnow()).total_seconds()
     # The timestamp state is whole seconds, so allow for rounding at the half.
     assert abs(int(hass.states.get(MINUTES).state) - remaining / 60) <= 0.51
     assert 8 <= int(hass.states.get(MINUTES).state) <= 25
-    assert hass.states.get(SOON).state == STATE_OFF
+    assert not soon(hass)
 
     # Minutes count down on the tick between fixes.
     before = int(hass.states.get(MINUTES).state)
@@ -123,13 +175,13 @@ async def test_drive_home(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -
     assert int(hass.states.get(MINUTES).state) == before - 2
 
     await drive(hass, freezer, [7_840.0 - 780.0 * i for i in range(1, 10)] + [500.0])
-    assert hass.states.get(SOON).state == STATE_ON
+    assert soon(hass)
     assert hass.states.get(NEAR).state == "100"
 
     await step(hass, freezer, ALEX, 20, zones=("zone.home",))
-    assert hass.states.get(HEADING).state == STATE_OFF
-    assert hass.states.get(HEADING).attributes["reason"] == "arrived"
-    assert hass.states.get(SOON).state == STATE_OFF
+    assert not heading(hass)
+    assert hass.states.get(STATUS).attributes["reason"] == "arrived"
+    assert not soon(hass)
     assert hass.states.get(EXPECTED).state == STATE_UNKNOWN
     assert hass.states.get(DISTANCE).state == "0"
 
@@ -140,12 +192,12 @@ async def test_other_zone_holds_off_arriving_soon(
     set_person(hass, ALEX, 5_000)
     await setup_person(hass)
     await drive(hass, freezer, [4_200, 3_400, 2_600])
-    assert hass.states.get(HEADING).state == STATE_ON
+    assert heading(hass)
     await drive(hass, freezer, [1_800, 1_000], zones_for={1_000: ("zone.station",)})
-    assert hass.states.get(HEADING).state == STATE_ON
-    assert hass.states.get(SOON).state == STATE_OFF
+    assert heading(hass)
+    assert not soon(hass)
     await step(hass, freezer, ALEX, 400)
-    assert hass.states.get(SOON).state == STATE_ON
+    assert soon(hass)
 
 
 async def test_zone_around_home_does_not_hold_off_arriving_soon(
@@ -168,7 +220,7 @@ async def test_zone_around_home_does_not_hold_off_arriving_soon(
     await drive(hass, freezer, [5_200, 4_400, 3_600, 2_800])
     for east in (1_800.0, 700.0):
         await step(hass, freezer, ALEX, east, zones=("zone.neighbourhood",))
-    assert hass.states.get(SOON).state == STATE_ON
+    assert soon(hass)
 
 
 async def test_threshold_is_per_person_and_restored(
@@ -192,20 +244,18 @@ async def test_threshold_is_per_person_and_restored(
     set_person(hass, ALEX, 30_000)
     await setup_person(hass)
     assert hass.states.get(THRESHOLD).state == "5.0"
-    assert hass.states.get(SOON).attributes["threshold_min"] == 5.0
 
     await step(hass, freezer, ALEX, 26_000, seconds=300)
     await step(hass, freezer, ALEX, 22_000, seconds=300)
-    assert hass.states.get(HEADING).state == STATE_ON
+    assert heading(hass)
     assert int(hass.states.get(MINUTES).state) > 5
-    assert hass.states.get(SOON).state == STATE_OFF
+    assert not soon(hass)
 
     await hass.services.async_call(
         "number", "set_value", {"entity_id": THRESHOLD, "value": 120}, blocking=True
     )
     assert hass.states.get(THRESHOLD).state == "120.0"
-    assert hass.states.get(SOON).state == STATE_ON
-    assert hass.states.get(SOON).attributes["threshold_min"] == 120.0
+    assert soon(hass)
 
 
 async def test_restored_threshold_out_of_range_ignored(hass: HomeAssistant) -> None:
@@ -227,13 +277,13 @@ async def test_startup_states_do_not_start_a_trip_home(
     await step(hass, freezer, ALEX, 15_000)
     await step(hass, freezer, ALEX, 10_000)
     assert hass.states.get(DISTANCE).state == "10000"
-    assert hass.states.get(HEADING).state == STATE_OFF
+    assert not heading(hass)
 
     await hass.async_start()
     await hass.async_block_till_done()
     await step(hass, freezer, ALEX, 9_000, seconds=300)
     await step(hass, freezer, ALEX, 6_000, seconds=300)
-    assert hass.states.get(HEADING).state == STATE_ON
+    assert heading(hass)
 
 
 async def test_near_home_follows_the_person_options(
@@ -276,7 +326,7 @@ async def test_near_home_fades_after_a_long_stay(
     near = hass.states.get(NEAR)
     assert near.state == "50"
     assert near.attributes["staying_since"] is not None
-    assert hass.states.get(HEADING).state == STATE_OFF
+    assert not heading(hass)
     await tick(hass, freezer, 30)
     assert hass.states.get(NEAR).state == "0"
 
@@ -293,23 +343,23 @@ async def test_missing_person_raises_issue(hass: HomeAssistant) -> None:
     await hass.async_block_till_done()
     assert issues.async_get_issue(DOMAIN, f"person_missing_{entry_id}") is None
     assert hass.states.get(DISTANCE).state == "5000"
-    assert hass.states.get(HEADING).state == STATE_OFF
+    assert not heading(hass)
 
     hass.states.async_remove(ALEX)
     await hass.async_block_till_done()
     assert issues.async_get_issue(DOMAIN, f"person_missing_{entry_id}") is not None
-    assert hass.states.get(HEADING).state == STATE_UNAVAILABLE
+    assert hass.states.get(STATUS).state == STATE_UNAVAILABLE
 
 
 async def test_person_without_a_location_yet_is_unknown(hass: HomeAssistant) -> None:
     """Regression: a person with no data was published as away."""
     hass.states.async_set(ALEX, STATE_UNKNOWN, {})
     await setup_person(hass)
-    for entity_id in (HEADING, SOON, DISTANCE, NEAR):
+    for entity_id in (STATUS, DISTANCE, NEAR):
         assert hass.states.get(entity_id).state == STATE_UNKNOWN, entity_id
     set_person(hass, ALEX, 5_000)
     await hass.async_block_till_done()
-    assert hass.states.get(HEADING).state == STATE_OFF
+    assert not heading(hass)
     assert hass.states.get(NEAR).state == "0"
 
 
@@ -332,7 +382,7 @@ async def test_poor_fix_near_home_is_not_arriving(
     set_person(hass, ALEX, 400, accuracy=2_000)
     await hass.async_block_till_done()
     assert hass.states.get(DISTANCE).state == "16000"
-    assert hass.states.get(SOON).state == STATE_OFF
+    assert not soon(hass)
     assert hass.states.get(NEAR).state == "0"
 
 

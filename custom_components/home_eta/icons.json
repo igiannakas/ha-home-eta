@@ -1,14 +1,6 @@
 {
   "entity": {
     "binary_sensor": {
-      "arriving_soon": {
-        "default": "mdi:home-outline",
-        "state": { "on": "mdi:home-clock-outline" }
-      },
-      "heading_home": {
-        "default": "mdi:home-outline",
-        "state": { "on": "mdi:home-import-outline" }
-      },
       "someone_arriving_soon": {
         "default": "mdi:home-outline",
         "state": { "on": "mdi:home-account" }
@@ -21,7 +13,16 @@
       "distance_to_home": { "default": "mdi:map-marker-distance" },
       "expected_home": { "default": "mdi:home-clock" },
       "minutes_to_home": { "default": "mdi:timer-sand" },
-      "near_home": { "default": "mdi:home-map-marker" }
+      "near_home": { "default": "mdi:home-map-marker" },
+      "status": {
+        "default": "mdi:home-outline",
+        "state": {
+          "arriving_soon": "mdi:home-clock-outline",
+          "away": "mdi:home-export-outline",
+          "heading_home": "mdi:home-import-outline",
+          "home": "mdi:home"
+        }
+      }
     }
   }
 }

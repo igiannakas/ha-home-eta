@@ -245,6 +245,7 @@ class HomewardState:
     since: float | None
     closest_m: float | None
     soon: bool
+    soon_restored: bool
 
 
 def typical_speed_mps(distance_m: float) -> float:
@@ -328,6 +329,8 @@ class HomewardTracker:
         self._closest_m: float | None = None
         self._soon = False
         """Arriving soon: latched on a trip home until the trip ends."""
+        self._soon_restored = False
+        """Arriving soon came back with a restored trip and has not changed."""
         self._threshold_s = DEFAULT_ARRIVING_SOON_MIN * 60.0
         self._in_other_zone = False
         """Inside a zone other than the target and those around it."""
@@ -407,6 +410,7 @@ class HomewardTracker:
             since=self._since,
             closest_m=self._closest_m,
             soon=self._soon,
+            soon_restored=self._soon_restored,
         )
 
     def load(self, saved: HomewardState) -> None:
@@ -428,6 +432,7 @@ class HomewardTracker:
         self._since = saved.since
         self._closest_m = saved.closest_m
         self._soon = saved.soon
+        self._soon_restored = saved.soon_restored
 
     def diagnostics(self) -> dict[str, object]:
         """Return internal state for diagnostics (no coordinates)."""
@@ -463,13 +468,23 @@ class HomewardTracker:
         if self._heading:
             self._end(HomewardReason.ZONE_CHANGED, now)
 
-    def set_threshold(self, seconds: float) -> None:
-        """Set the arriving-soon threshold; arriving soon is judged afresh."""
+    def set_threshold(self, seconds: float, *, saved: bool = False) -> None:
+        """Set the arriving-soon threshold.
+
+        A new threshold judges arriving soon afresh at the next fix or tick.
+        ``saved`` is for the threshold saved before a restart, applied while
+        setting up: an arriving soon restored with the trip was judged with
+        it, so it holds. Any other arriving soon is judged afresh, as it may
+        have been judged with the default before the saved value arrived.
+        """
         if not math.isfinite(seconds) or seconds <= 0:
             raise ValueError(f"threshold must be positive, got {seconds}")
+        keep = saved and self._soon_restored
+        self._soon_restored = False
         if seconds != self._threshold_s:
             self._threshold_s = seconds
-            self._soon = False
+            if not keep:
+                self._soon = False
 
     def set_other_zone(self, inside: bool) -> None:
         """Say whether the person is in a zone other than home and its rings.
@@ -536,7 +551,7 @@ class HomewardTracker:
             self._heading = True
             self._reason = HomewardReason.RESTORED
             self._since = trip.since
-            self._soon = trip.arriving_soon
+            self._soon = self._soon_restored = trip.arriving_soon
             restored = True
         if restored and last is None:
             self._restored_heard = last_heard
@@ -738,7 +753,7 @@ class HomewardTracker:
     def _judge_soon(self, now: float, distance: float) -> None:
         """Turn arriving soon on when due; it stays on until the trip ends."""
         if not self._heading or self._in_other_zone:
-            self._soon = False
+            self._soon = self._soon_restored = False
             return
         if self._soon:
             return
@@ -746,6 +761,7 @@ class HomewardTracker:
         self._soon = distance <= self._p.arriving_soon_distance_m or (
             arrival is not None and arrival - now <= self._threshold_s
         )
+        self._soon_restored = False
 
     def _start(self, reason: HomewardReason, now: float, distance: float) -> None:
         self._heading = True
@@ -753,7 +769,7 @@ class HomewardTracker:
         self._since = now
         self._closest_m = distance
         self._trigger = frozenset()
-        self._soon = False
+        self._soon = self._soon_restored = False
 
     def _end(self, reason: HomewardReason, now: float) -> None:
         self._heading = False
@@ -761,7 +777,7 @@ class HomewardTracker:
         self._since = now
         self._closest_m = None
         self._trigger = frozenset()
-        self._soon = False
+        self._soon = self._soon_restored = False
 
     def _shift_times(self, delta: float) -> None:
         """Move every stored time by ``delta`` (after the clock stepped back)."""

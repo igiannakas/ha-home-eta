@@ -785,3 +785,43 @@ def test_a_bad_part_of_saved_data_is_dropped() -> None:
         {"last_heard": T0, "trip": {**GOOD_TRIP, "since": None}, "stay": GOOD_STAY}
     )
     assert data == HomewardRestore(T0, None, HomewardStay(T0, HOME_LAT, HOME_LON, 5))
+
+
+def restored_at_5_km(soon: bool) -> HomewardTracker:
+    """Return a tracker with a trip home restored 5 km out (about 14 min left)."""
+    tracker = HomewardTracker(P, TARGET)
+    data = HomewardRestore(T0, HomewardTrip(T0 - 600, 30_000, 5_000, soon))
+    assert tracker.restore(data, T0, 5_000)
+    return tracker
+
+
+@pytest.mark.parametrize("threshold_first", [True, False])
+def test_the_saved_threshold_keeps_a_restored_arriving_soon(
+    threshold_first: bool,
+) -> None:
+    """Regression: a non-default threshold applied at setup turned it off."""
+    if threshold_first:
+        tracker = HomewardTracker(P, TARGET)
+        tracker.set_threshold(10 * MIN, saved=True)
+        data = HomewardRestore(T0, HomewardTrip(T0 - 600, 30_000, 5_000, True))
+        assert tracker.restore(data, T0, 5_000)
+    else:
+        tracker = restored_at_5_km(True)
+        tracker.set_threshold(10 * MIN, saved=True)
+    tracker.tick(T0 + 1, None)
+    assert due_in(tracker, T0 + 1) > 10 * MIN
+    assert tracker.arriving_soon
+    # A change by the user afterwards is judged afresh.
+    tracker.set_threshold(11 * MIN)
+    tracker.tick(T0 + 2, None)
+    assert not tracker.arriving_soon
+
+
+def test_the_saved_threshold_rejudges_one_judged_with_the_default() -> None:
+    """Restored off, judged on with the default 15 minutes, then 10 arrives."""
+    tracker = restored_at_5_km(False)
+    tracker.tick(T0 + 1, None)
+    assert tracker.arriving_soon
+    tracker.set_threshold(10 * MIN, saved=True)
+    tracker.tick(T0 + 2, None)
+    assert not tracker.arriving_soon

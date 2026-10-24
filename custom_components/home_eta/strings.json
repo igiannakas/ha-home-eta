@@ -39,7 +39,7 @@
           "person": "Uses the person's phone location.",
           "zone": "Usually Home."
         },
-        "description": "Say when one person is heading home, when they will get there and how near they are.",
+        "description": "Say whether one person is heading home, when they will get there and how near they are.",
         "title": "Add a person"
       },
       "user": {
@@ -53,51 +53,6 @@
   },
   "entity": {
     "binary_sensor": {
-      "arriving_soon": {
-        "name": "Arriving soon",
-        "state_attributes": {
-          "threshold_min": {
-            "name": "Threshold"
-          }
-        }
-      },
-      "heading_home": {
-        "name": "Heading home",
-        "state_attributes": {
-          "farthest_m": {
-            "name": "Farthest since last stay"
-          },
-          "reason": {
-            "name": "Reason",
-            "state": {
-              "arrived": "Arrived",
-              "at_place": "Staying somewhere",
-              "initial": "No trip home yet",
-              "moving_away": "Moving away",
-              "overdue": "Overdue",
-              "progress": "Getting closer",
-              "restored": "Restored",
-              "zone_changed": "Zone changed",
-              "zone_crossing": "Entered a zone around home"
-            }
-          },
-          "since": {
-            "name": "Since"
-          },
-          "speed_mps": {
-            "name": "Speed"
-          },
-          "speed_source": {
-            "name": "Speed from",
-            "state": {
-              "measured": "Measured",
-              "on_foot": "On foot",
-              "typical": "Typical for the distance",
-              "zone_crossings": "Between zones around home"
-            }
-          }
-        }
-      },
       "someone_arriving_soon": {
         "name": "Someone arriving soon",
         "state_attributes": {
@@ -145,6 +100,9 @@
       "near_home": {
         "name": "Near home",
         "state_attributes": {
+          "distance_m": {
+            "name": "Distance"
+          },
           "fade_after_min": {
             "name": "Fades after"
           },
@@ -162,6 +120,64 @@
           },
           "staying_since": {
             "name": "Staying since"
+          }
+        }
+      },
+      "status": {
+        "name": "Status",
+        "state": {
+          "arriving_soon": "Arriving soon",
+          "away": "Away",
+          "heading_home": "Heading home",
+          "home": "Home"
+        },
+        "state_attributes": {
+          "farthest_m": {
+            "name": "Farthest since last stay"
+          },
+          "missing_members": {
+            "name": "Missing members"
+          },
+          "persons_arriving_soon": {
+            "name": "Arriving soon"
+          },
+          "persons_away": {
+            "name": "Away"
+          },
+          "persons_heading_home": {
+            "name": "Heading home"
+          },
+          "persons_home": {
+            "name": "Home"
+          },
+          "reason": {
+            "name": "Reason",
+            "state": {
+              "arrived": "Arrived",
+              "at_place": "Staying somewhere",
+              "initial": "No trip home yet",
+              "moving_away": "Moving away",
+              "overdue": "Overdue",
+              "progress": "Getting closer",
+              "restored": "Restored",
+              "zone_changed": "Zone changed",
+              "zone_crossing": "Entered a zone around home"
+            }
+          },
+          "since": {
+            "name": "Since"
+          },
+          "speed_mps": {
+            "name": "Speed"
+          },
+          "speed_source": {
+            "name": "Speed from",
+            "state": {
+              "measured": "Measured",
+              "on_foot": "On foot",
+              "typical": "Typical for the distance",
+              "zone_crossings": "Between zones around home"
+            }
           }
         }
       }

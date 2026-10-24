@@ -68,7 +68,9 @@ from .core.homeward import HomewardRestore, NearHomeConfig
 from .core.kinematic import FixOutcome, Target
 from .core.params import EstimatorParams
 from .core.tracker import (
+    STATUS_ORDER,
     PersonReport,
+    PersonStatus,
     PersonTracker,
     TrackerConfig,
     TrackerSnapshot,
@@ -150,7 +152,6 @@ class PersonView:
     available: bool
     snapshot: TrackerSnapshot | None
     """None until the person's whereabouts are first known."""
-    threshold_min: float
 
     @property
     def expected_home(self) -> datetime | None:
@@ -209,7 +210,7 @@ class PersonRuntime:
         self._has_report = False
         """A usable report of the person has arrived (until then: no data)."""
         self._fix_log: deque[FixLogEntry] = deque(maxlen=FIX_LOG_SIZE)
-        self.view = PersonView(False, None, 0.0)
+        self.view = PersonView(False, None)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -358,9 +359,14 @@ class PersonRuntime:
     # -- controls ----------------------------------------------------------
 
     @callback
-    def set_threshold(self, minutes: float) -> None:
-        """Set the arriving-soon threshold (from the number entity)."""
-        self.tracker.set_threshold(minutes * 60.0)
+    def set_threshold(self, minutes: float, *, saved: bool = False) -> None:
+        """Set the arriving-soon threshold (from the number entity).
+
+        ``saved`` when it is the value saved before a restart or reload,
+        rather than a change: an arriving soon restored with the trip home
+        was judged with that value and holds.
+        """
+        self.tracker.set_threshold(minutes * 60.0, saved=saved)
         self.tracker.tick(dt_util.utcnow().timestamp())
         self._refresh()
 
@@ -461,7 +467,6 @@ class PersonRuntime:
         self.view = PersonView(
             available=bool(self._person_present),
             snapshot=snapshot,
-            threshold_min=self.tracker.threshold_s / 60.0,
         )
         for update in list(self._listeners):
             update()
@@ -470,22 +475,11 @@ class PersonRuntime:
     def _log_changes(
         self, before: TrackerSnapshot | None, after: TrackerSnapshot | None
     ) -> None:
-        if after is None:
+        if after is None or (before is not None and before.status is after.status):
             return
-        homeward = after.homeward
-        if before is None or before.heading_home != after.heading_home:
-            _LOGGER.debug(
-                "%s: heading home %s (%s)",
-                self.person_id,
-                "on" if homeward.heading else "off",
-                homeward.reason,
-            )
-        if before is None or before.arriving_soon != after.arriving_soon:
-            _LOGGER.debug(
-                "%s: arriving soon %s",
-                self.person_id,
-                "on" if after.arriving_soon else "off",
-            )
+        _LOGGER.debug(
+            "%s: %s (%s)", self.person_id, after.status, after.homeward.reason
+        )
 
     @callback
     def _signal_group(self) -> None:
@@ -554,12 +548,10 @@ class GroupView:
 
     heading_home: tuple[HeadingHome, ...] = ()
     """Members heading home, the one expected first leading."""
-    persons_home: tuple[str, ...] = ()
-    arriving_soon: tuple[str, ...] = ()
+    by_status: Mapping[PersonStatus, tuple[str, ...]] = field(default_factory=dict)
+    """Members with data, by status."""
     arriving_soon_names: tuple[str, ...] = ()
     missing: tuple[str, ...] = ()
-    reporting: int = 0
-    """Members with data; with none, the group knows nothing."""
     near: NearHome | None = None
     """None when no member's whereabouts are known."""
 
@@ -567,6 +559,28 @@ class GroupView:
     def first(self) -> HeadingHome | None:
         """Return the member heading home who is expected first."""
         return self.heading_home[0] if self.heading_home else None
+
+    @property
+    def reporting(self) -> int:
+        """Return how many members have data; with none, the group knows nothing."""
+        return sum(len(members) for members in self.by_status.values())
+
+    @property
+    def persons_home(self) -> tuple[str, ...]:
+        """Return the members at home."""
+        return self.by_status.get(PersonStatus.HOME, ())
+
+    @property
+    def arriving_soon(self) -> tuple[str, ...]:
+        """Return the members arriving soon."""
+        return self.by_status.get(PersonStatus.ARRIVING_SOON, ())
+
+    @property
+    def status(self) -> PersonStatus | None:
+        """Return the most-home status of any member, None with no data."""
+        return next(
+            (status for status in STATUS_ORDER if self.by_status.get(status)), None
+        )
 
 
 class GroupRuntime:
@@ -634,8 +648,7 @@ class GroupRuntime:
     def _refresh(self) -> None:
         persons = self.hass.data[DATA_KEY].persons
         heading: list[HeadingHome] = []
-        home: list[str] = []
-        soon: list[str] = []
+        by_status: dict[PersonStatus, list[str]] = {}
         soon_names: list[str] = []
         missing: list[str] = []
         near: NearHome | None = None
@@ -650,13 +663,12 @@ class GroupRuntime:
                 missing.append(person_id)
                 continue
             name = runtime.entry.title
-            if snapshot.at_home:
-                home.append(person_id)
+            status = snapshot.status
+            by_status.setdefault(status, []).append(person_id)
             expected, minutes = view.expected_home, view.minutes_to_home
             if expected is not None and minutes is not None:
                 heading.append(HeadingHome(person_id, name, expected, minutes))
-            if snapshot.arriving_soon:
-                soon.append(person_id)
+            if status is PersonStatus.ARRIVING_SOON:
                 soon_names.append(name)
             value, distance = snapshot.near_home, snapshot.distance_m
             if (
@@ -670,11 +682,9 @@ class GroupRuntime:
         heading.sort(key=lambda member: (member.arrival, member.person_id))
         self.view = GroupView(
             heading_home=tuple(heading),
-            persons_home=tuple(home),
-            arriving_soon=tuple(soon),
+            by_status={status: tuple(ids) for status, ids in by_status.items()},
             arriving_soon_names=tuple(soon_names),
             missing=tuple(missing),
-            reporting=len(self.members) - len(missing),
             near=near,
         )
         for update in list(self._listeners):
@@ -694,8 +704,12 @@ class GroupRuntime:
                 }
                 for member in view.heading_home
             ],
-            "persons_home": list(view.persons_home),
-            "arriving_soon": list(view.arriving_soon),
+            "status": None if view.status is None else view.status.value,
+            "by_status": {
+                status.value: list(view.by_status[status])
+                for status in STATUS_ORDER
+                if status in view.by_status
+            },
             "missing": list(view.missing),
             "near_home": None
             if view.near is None

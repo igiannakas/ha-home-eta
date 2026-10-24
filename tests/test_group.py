@@ -11,13 +11,15 @@ from homeassistant.util import dt as dt_util
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.home_eta.const import CONF_NEAR_HOME_RADIUS_M
 from tests.helpers import ALEX, SAM, group_entry, person_entry, set_person, step
 
 EXPECTED = "sensor.home_eta_expected_home"
 MINUTES = "sensor.home_eta_minutes_to_home"
 NEAR = "sensor.home_eta_near_home"
 SOMEONE_SOON = "binary_sensor.home_eta_someone_arriving_soon"
-ALL = (EXPECTED, MINUTES, NEAR, SOMEONE_SOON)
+STATUS = "sensor.home_eta_status"
+ALL = (STATUS, EXPECTED, MINUTES, NEAR, SOMEONE_SOON)
 
 pytestmark = pytest.mark.usefixtures("zones")
 
@@ -63,6 +65,10 @@ async def test_group_picks_the_first_expected_and_the_nearest(
     assert near.state == "100"
     assert near.attributes["person"] == SAM
     assert near.attributes["persons_home"] == [SAM]
+    status = hass.states.get(STATUS)
+    assert status.state == "home"
+    assert status.attributes["persons_home"] == [SAM]
+    assert status.attributes["persons_away"] == [ALEX]
 
     # Alex heads home from 30 km.
     await step(hass, freezer, ALEX, 26_000, seconds=300)
@@ -76,12 +82,18 @@ async def test_group_picks_the_first_expected_and_the_nearest(
     assert minutes == expected.attributes["heading_home"][0]["minutes"]
     assert minutes > 15
     assert hass.states.get("sensor.alex_minutes_to_home").state == str(minutes)
+    # Sam is still home: the group says so.
+    assert hass.states.get(STATUS).state == "home"
+    assert hass.states.get(STATUS).attributes["persons_heading_home"] == [ALEX]
 
     # Sam goes out; nobody is home and both are far.
     await step(hass, freezer, SAM, 5_000)
     near = hass.states.get(NEAR)
     assert near.state == "0"
     assert near.attributes["persons_home"] == []
+    status = hass.states.get(STATUS)
+    assert status.state == "heading_home"
+    assert status.attributes["persons_away"] == [SAM]
 
     # Sam turns round and is due before Alex, and arriving soon.
     for east in (4_000, 3_000, 2_000):
@@ -92,11 +104,30 @@ async def test_group_picks_the_first_expected_and_the_nearest(
     assert hass.states.get(SOMEONE_SOON).state == STATE_ON
     assert hass.states.get(SOMEONE_SOON).attributes["persons"] == [SAM]
     assert hass.states.get(SOMEONE_SOON).attributes["names"] == ["Sam"]
+    status = hass.states.get(STATUS)
+    assert status.state == "arriving_soon"
+    assert status.attributes["persons_arriving_soon"] == [SAM]
     # 2 km: (3000 - 2000) / (3000 - 800) = 45 %.
     near = hass.states.get(NEAR)
     assert near.state == "45"
     assert near.attributes["person"] == SAM
     assert near.attributes["person_name"] == "Sam"
+
+
+async def test_near_home_uses_each_members_own_radius(hass: HomeAssistant) -> None:
+    set_person(hass, ALEX, 4_000)
+    set_person(hass, SAM, 2_000)
+    await setup_entries(
+        hass,
+        person_entry(ALEX, options={CONF_NEAR_HOME_RADIUS_M: 8_000}),
+        person_entry(SAM),
+        group_entry([ALEX, SAM]),
+    )
+    # Alex: (8000 - 4000) / 7200 = 56 %; Sam, nearer, by 3 km: 45 %.
+    near = hass.states.get(NEAR)
+    assert near.state == "56"
+    assert near.attributes["person"] == ALEX
+    assert near.attributes["distance_m"] == 4_000
 
 
 async def test_missing_members_reported(hass: HomeAssistant) -> None:
@@ -111,6 +142,9 @@ async def test_missing_members_reported(hass: HomeAssistant) -> None:
     assert hass.states.get(EXPECTED).attributes["missing_members"] == [ALEX, SAM]
     # With no member reporting, the group cannot say nobody is arriving.
     assert hass.states.get(SOMEONE_SOON).state == STATE_UNKNOWN
+    status = hass.states.get(STATUS)
+    assert status.state == STATE_UNKNOWN
+    assert status.attributes["missing_members"] == [ALEX, SAM]
     assert hass.states.get(NEAR).state == STATE_UNKNOWN
 
 

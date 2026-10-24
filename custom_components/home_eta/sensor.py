@@ -16,18 +16,37 @@ from homeassistant.components.sensor import (
 from homeassistant.const import PERCENTAGE, UnitOfLength, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import (
+    ExtraStoredData,
+    RestoredExtraData,
+    RestoreEntity,
+)
 from homeassistant.util import dt as dt_util
 
 from . import HomeEtaConfigEntry
-from .const import KEY_DISTANCE, KEY_EXPECTED_HOME, KEY_MINUTES, KEY_NEAR_HOME
+from .const import (
+    KEY_DISTANCE,
+    KEY_EXPECTED_HOME,
+    KEY_MINUTES,
+    KEY_NEAR_HOME,
+    KEY_STATUS,
+)
+from .core.homeward import HomewardRestore
+from .core.tracker import STATUS_ORDER
 from .entity import GroupEntity, PersonEntity
 from .runtime import GroupRuntime, GroupView, PersonRuntime, PersonView
 
 PARALLEL_UPDATES = 0
 
+STATUS_OPTIONS = [status.value for status in STATUS_ORDER]
+
 
 def _percent(value: float | None) -> int | None:
     return None if value is None else round(value * 100.0)
+
+
+def _iso(value: float | None) -> str | None:
+    return None if value is None else dt_util.utc_from_timestamp(value).isoformat()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -76,17 +95,86 @@ async def async_setup_entry(
     if isinstance(runtime, GroupRuntime):
         async_add_entities(
             [
+                GroupStatusSensor(runtime),
                 GroupExpectedHomeSensor(runtime),
                 GroupMinutesSensor(runtime),
                 GroupNearHomeSensor(runtime),
             ]
         )
         return
-    entities: list[SensorEntity] = [
+    entities: list[SensorEntity] = [StatusSensor(runtime)]
+    entities.extend(
         PersonSensor(runtime, description) for description in PERSON_SENSORS
-    ]
+    )
     entities.append(NearHomeSensor(runtime))
     async_add_entities(entities)
+
+
+class StatusSensor(PersonEntity, SensorEntity, RestoreEntity):
+    """Where the person is on the way home: home, arriving soon, heading home or away.
+
+    Heading home comes on at the first clear progress towards home, or on
+    entering a zone around home, and lasts until the person gets home or the
+    trip clearly is not one. Arriving soon is the last part of it: from when
+    the person is expected within their threshold, or is close by, until the
+    trip ends; held off inside another zone. The trip home (and a stay
+    somewhere) is saved for a restart.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = STATUS_OPTIONS
+    _unrecorded_attributes = frozenset({"speed_mps", "farthest_m"})
+
+    def __init__(self, runtime: PersonRuntime) -> None:
+        """Initialise."""
+        super().__init__(runtime, KEY_STATUS)
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the trip home and stay saved before a restart or reload."""
+        await super().async_added_to_hass()
+        extra = await self.async_get_last_extra_data()
+        if extra is None:
+            return
+        data = HomewardRestore.from_dict(extra.as_dict())
+        if data is not None:
+            self._runtime.restore_homeward(data)
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData | None:
+        """Save the trip home and stay, if any."""
+        data = self._runtime.tracker.homeward.restore_data()
+        return None if data is None else RestoredExtraData(data.as_dict())
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the status, None until the person's whereabouts are known."""
+        snap = self._runtime.view.snapshot
+        return None if snap is None else snap.status.value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return why and since when, and the speed behind the expected arrival.
+
+        The reason and its time are those of the trip home: when it started,
+        or when and why it last ended.
+        """
+        snap = self._runtime.view.snapshot
+        if snap is None:
+            return {}
+        homeward = snap.homeward
+        return {
+            "reason": homeward.reason.value,
+            "since": _iso(homeward.since),
+            "speed_mps": None
+            if homeward.speed_mps is None
+            else round(homeward.speed_mps, 1),
+            "speed_source": None
+            if homeward.speed_source is None
+            else homeward.speed_source.value,
+            "farthest_m": None
+            if homeward.farthest_m is None
+            else round(homeward.farthest_m),
+        }
 
 
 class PersonSensor(PersonEntity, SensorEntity):
@@ -136,12 +224,41 @@ class NearHomeSensor(PersonEntity, SensorEntity):
         still_since = None if snap is None else snap.homeward.still_since
         fade_after = config.fade_after_s
         return {
-            "staying_since": None
-            if still_since is None
-            else dt_util.utc_from_timestamp(still_since).isoformat(),
+            "staying_since": _iso(still_since),
             "radius_m": round(config.radius_m),
             "fade_after_min": None if fade_after is None else round(fade_after / 60.0),
         }
+
+
+class GroupStatusSensor(GroupEntity, SensorEntity):
+    """The most-home status of any member: home if anyone is, and so on.
+
+    Unknown while no member has data. Its attributes list who is where.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = STATUS_OPTIONS
+
+    def __init__(self, runtime: GroupRuntime) -> None:
+        """Initialise."""
+        super().__init__(runtime, KEY_STATUS)
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the most-home status."""
+        status = self._runtime.view.status
+        return None if status is None else status.value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the members in each status, and those without data."""
+        view: GroupView = self._runtime.view
+        attributes: dict[str, Any] = {
+            f"persons_{status.value}": list(view.by_status.get(status, ()))
+            for status in STATUS_ORDER
+        }
+        attributes["missing_members"] = list(view.missing)
+        return attributes
 
 
 class GroupExpectedHomeSensor(GroupEntity, SensorEntity):
@@ -201,9 +318,13 @@ class GroupMinutesSensor(GroupEntity, SensorEntity):
 
 
 class GroupNearHomeSensor(GroupEntity, SensorEntity):
-    """How near home the nearest member is, 0-100 %; 100 % while anyone is home."""
+    """How near home the nearest member is, 0-100 %; 100 % while anyone is home.
+
+    Each member's near home uses their own radius and fade.
+    """
 
     _attr_native_unit_of_measurement = PERCENTAGE
+    _unrecorded_attributes = frozenset({"distance_m"})
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_suggested_display_precision = 0
 
@@ -224,5 +345,6 @@ class GroupNearHomeSensor(GroupEntity, SensorEntity):
         return {
             "person": None if near is None else near.person_id,
             "person_name": None if near is None else near.name,
+            "distance_m": None if near is None else round(near.distance_m),
             "persons_home": list(self._runtime.view.persons_home),
         }

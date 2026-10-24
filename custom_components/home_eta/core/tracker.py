@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from .geo import haversine_m, is_valid_coordinate
@@ -48,6 +49,23 @@ class TrackerConfig:
     near_home: NearHomeConfig = field(default_factory=NearHomeConfig)
 
 
+class PersonStatus(StrEnum):
+    """Where a person is on the way home, most home first.
+
+    Arriving soon is part of a trip home, so a short trip can go from away
+    straight to arriving soon.
+    """
+
+    HOME = "home"
+    ARRIVING_SOON = "arriving_soon"
+    HEADING_HOME = "heading_home"
+    AWAY = "away"
+
+
+STATUS_ORDER: tuple[PersonStatus, ...] = tuple(PersonStatus)
+"""Most home first: a group shows the first of these any member is in."""
+
+
 @dataclass(frozen=True, slots=True)
 class TrackerSnapshot:
     """Everything published for one person at an instant."""
@@ -75,6 +93,17 @@ class TrackerSnapshot:
     def arriving_soon(self) -> bool:
         """Return True while arriving soon."""
         return self.homeward.arriving_soon
+
+    @property
+    def status(self) -> PersonStatus:
+        """Return the stage of the way home the person is at."""
+        if self.at_home:
+            return PersonStatus.HOME
+        if self.arriving_soon:
+            return PersonStatus.ARRIVING_SOON
+        if self.heading_home:
+            return PersonStatus.HEADING_HOME
+        return PersonStatus.AWAY
 
 
 class PersonTracker:
@@ -121,9 +150,12 @@ class PersonTracker:
         """Set the zones that enclose the target (rings around home)."""
         self._homeward.set_rings(rings)
 
-    def set_threshold(self, seconds: float) -> None:
-        """Set the arriving-soon threshold (applied at the next tick or fix)."""
-        self._homeward.set_threshold(seconds)
+    def set_threshold(self, seconds: float, *, saved: bool = False) -> None:
+        """Set the arriving-soon threshold (applied at the next tick or fix).
+
+        ``saved``: the value saved before a restart (see HomewardTracker).
+        """
+        self._homeward.set_threshold(seconds, saved=saved)
 
     def set_target(self, target: Target, now: float) -> None:
         """Move the target (the zone was edited).

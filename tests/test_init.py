@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import permutations
 from typing import Any
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from custom_components.home_eta.migration import (
     CONFIG_MINOR_VERSION,
     LEGACY_GROUP_ENTITIES,
     LEGACY_PERSON_ENTITIES,
+    REPLACED_BY_STATUS,
 )
 from custom_components.home_eta.runtime import DATA_KEY, PersonRuntime
 from tests.helpers import ALEX, SAM, group_entry, person_entry, set_person, step
@@ -324,14 +326,16 @@ def legacy_person(person: str, options: dict[str, Any]) -> MockConfigEntry:
     )
 
 
-def legacy_group(members: list[str], **near: int) -> MockConfigEntry:
+def legacy_group(
+    members: list[str], *, title: str = "Home ETA", **near: int
+) -> MockConfigEntry:
     """Return a group entry as Home ETA 1.x saved it."""
     return MockConfigEntry(
         domain=DOMAIN,
-        title="Home ETA",
+        title=title,
         data={CONF_ENTRY_TYPE: ENTRY_TYPE_GROUP, CONF_ZONE: "zone.home"},
         options={CONF_MEMBERS: members, **near},
-        unique_id="group|zone.home|home_eta",
+        unique_id=f"group|zone.home|{title.lower()}",
         version=1,
         minor_version=1,
     )
@@ -378,6 +382,7 @@ async def test_migration_from_1_x(
         entry.add_to_hass(hass)
     retired = register_legacy_entities(hass, alex, "sensor", LEGACY_PERSON_ENTITIES)
     retired += register_legacy_entities(hass, group, "sensor", LEGACY_GROUP_ENTITIES)
+    retired += register_legacy_entities(hass, alex, "binary_sensor", REPLACED_BY_STATUS)
     kept = register_legacy_entities(hass, alex, "sensor", ("minutes_to_home",))
     history = f"{DOMAIN}.history.{alex.entry_id}"
     hass_storage[history] = {"version": 1, "key": history, "data": {"trips": []}}
@@ -408,6 +413,83 @@ async def test_migration_from_1_x(
     for entity_id in kept:
         assert registry.async_get(entity_id) is not None, entity_id
     assert history not in hass_storage
+
+
+async def test_migration_from_2_0(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Heading home and arriving soon became states of one status sensor."""
+    set_person(hass, ALEX, 5_000)
+    options = {CONF_NEAR_HOME_RADIUS_M: 4_000, CONF_NEAR_HOME_FADE_AFTER_MIN: 60}
+    alex = person_entry(ALEX, options=options)
+    group = group_entry([ALEX])
+    for entry in (alex, group):
+        entry.add_to_hass(hass)
+        hass.config_entries.async_update_entry(entry, minor_version=2)
+    retired = register_legacy_entities(hass, alex, "binary_sensor", REPLACED_BY_STATUS)
+    kept = register_legacy_entities(hass, alex, "sensor", ("near_home",))
+    kept += register_legacy_entities(
+        hass, group, "binary_sensor", ("someone_arriving_soon",)
+    )
+    assert await hass.config_entries.async_setup(alex.entry_id)
+    await hass.async_block_till_done()
+    for entry in (alex, group):
+        assert entry.state is ConfigEntryState.LOADED
+        assert entry.minor_version == CONFIG_MINOR_VERSION
+    assert dict(alex.options) == options
+    registry = er.async_get(hass)
+    for entity_id in retired:
+        assert registry.async_get(entity_id) is None, entity_id
+    for entity_id in kept:
+        assert registry.async_get(entity_id) is not None, entity_id
+    assert hass.states.get("sensor.alex_status") is not None
+
+
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+async def test_migration_picks_the_same_group_whatever_the_order(
+    hass: HomeAssistant, order: tuple[int, ...]
+) -> None:
+    """In two groups: the settings of the one whose title comes first."""
+    set_person(hass, ALEX, 5_000)
+    alex = legacy_person(ALEX, {})
+    beta = legacy_group(
+        [ALEX], title="Beta", near_home_radius_m=8_000, near_home_fade_after_min=30
+    )
+    alpha = legacy_group(
+        [ALEX], title="Alpha", near_home_radius_m=5_000, near_home_fade_after_min=0
+    )
+    entries = [alex, beta, alpha]
+    for index in order:
+        entries[index].add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entries[order[0]].entry_id)
+    await hass.async_block_till_done()
+    assert dict(alex.options) == {
+        CONF_NEAR_HOME_RADIUS_M: 5_000,
+        CONF_NEAR_HOME_FADE_AFTER_MIN: 0,
+    }
+
+
+async def test_retired_entities_and_trips_are_removed_at_every_setup(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """After a downgrade and an upgrade, the older release's leftovers go too."""
+    set_person(hass, ALEX, 5_000)
+    alex = person_entry(ALEX)
+    group = group_entry([ALEX])
+    for entry in (alex, group):
+        entry.add_to_hass(hass)
+    retired = register_legacy_entities(hass, alex, "sensor", LEGACY_PERSON_ENTITIES)
+    retired += register_legacy_entities(hass, alex, "binary_sensor", REPLACED_BY_STATUS)
+    retired += register_legacy_entities(hass, group, "sensor", LEGACY_GROUP_ENTITIES)
+    history = f"{DOMAIN}.history.{alex.entry_id}"
+    hass_storage[history] = {"version": 1, "key": history, "data": {"trips": []}}
+    assert await hass.config_entries.async_setup(alex.entry_id)
+    await hass.async_block_till_done()
+    registry = er.async_get(hass)
+    for entity_id in retired:
+        assert registry.async_get(entity_id) is None, entity_id
+    assert history not in hass_storage
+    assert registry.async_get("sensor.alex_status") is not None
 
 
 async def test_migration_falls_back_to_defaults_for_unusable_group_settings(
