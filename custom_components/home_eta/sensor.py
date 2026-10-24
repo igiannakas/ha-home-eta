@@ -233,7 +233,8 @@ class NearHomeSensor(PersonEntity, SensorEntity):
 class GroupStatusSensor(GroupEntity, SensorEntity):
     """The most-home status of any member: home if anyone is, and so on.
 
-    Unknown while no member has data. Its attributes list who is where.
+    Unknown while a member has no data and nobody is home. Its attributes
+    list who is where.
     """
 
     _attr_device_class = SensorDeviceClass.ENUM
@@ -318,9 +319,10 @@ class GroupMinutesSensor(GroupEntity, SensorEntity):
 
 
 class GroupNearHomeSensor(GroupEntity, SensorEntity):
-    """How near home the nearest member is, 0-100 %; 100 % while anyone is home.
+    """The highest near home of any member, 0-100 %; 100 % while anyone is home.
 
-    Each member's near home uses their own radius and fade.
+    Each member's near home uses their own radius and fade, so the member it
+    shows is not always the one nearest.
     """
 
     _attr_native_unit_of_measurement = PERCENTAGE

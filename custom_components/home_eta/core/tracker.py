@@ -150,12 +150,9 @@ class PersonTracker:
         """Set the zones that enclose the target (rings around home)."""
         self._homeward.set_rings(rings)
 
-    def set_threshold(self, seconds: float, *, saved: bool = False) -> None:
-        """Set the arriving-soon threshold (applied at the next tick or fix).
-
-        ``saved``: the value saved before a restart (see HomewardTracker).
-        """
-        self._homeward.set_threshold(seconds, saved=saved)
+    def set_threshold(self, seconds: float) -> None:
+        """Set the arriving-soon threshold (applied at the next tick or fix)."""
+        self._homeward.set_threshold(seconds)
 
     def set_target(self, target: Target, now: float) -> None:
         """Move the target (the zone was edited).

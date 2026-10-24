@@ -67,7 +67,7 @@ class ArrivingSoonThreshold(PersonEntity, RestoreNumber):
         ):
             self._attr_native_value = last.native_value
         assert self._attr_native_value is not None
-        self._runtime.set_threshold(self._attr_native_value, saved=True)
+        self._runtime.set_threshold(self._attr_native_value)
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the threshold."""

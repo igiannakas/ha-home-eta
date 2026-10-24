@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import nullcontext
+from types import ModuleType
 from typing import Any
+from unittest.mock import patch
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import STATE_UNKNOWN
-from homeassistant.core import CoreState, HomeAssistant, State
+from homeassistant.const import EVENT_STATE_CHANGED, STATE_ON, STATE_UNKNOWN
+from homeassistant.core import (
+    CoreState,
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    State,
+    callback,
+)
 from homeassistant.util import dt as dt_util
 import pytest
 from pytest_homeassistant_custom_component.common import (
@@ -15,10 +26,22 @@ from pytest_homeassistant_custom_component.common import (
     mock_restore_cache_with_extra_data,
 )
 
-from tests.helpers import ALEX, person_entry, set_person, step
+from custom_components.home_eta import (
+    number as number_platform,
+    sensor as sensor_platform,
+)
+from tests.helpers import ALEX, group_entry, person_entry, set_person, step
 from tests.sim import to_latlon
 
 STATUS = "sensor.alex_status"
+THRESHOLD = "number.alex_arriving_soon_threshold"
+SOMEONE_SOON = "binary_sensor.home_eta_someone_arriving_soon"
+THRESHOLD_DATA = {
+    "native_max_value": 120,
+    "native_min_value": 1,
+    "native_step": 1,
+    "native_unit_of_measurement": "min",
+}
 EXPECTED = "sensor.alex_expected_home"
 NEAR = "sensor.alex_near_home"
 
@@ -200,6 +223,7 @@ async def test_arriving_soon_restored_with_a_personal_threshold(
         "farthest_m": 30_000,
         "closest_m": 5_000,
         "arriving_soon": saved_soon,
+        "threshold_s": 600.0,
     }
     mock_restore_cache_with_extra_data(
         hass,
@@ -342,6 +366,7 @@ async def test_a_restored_trip_survives_a_second_restart(hass: HomeAssistant) ->
         "farthest_m": 30_000.0,
         "closest_m": 20_000.0,
         "arriving_soon": False,
+        "threshold_s": 900.0,
     }
     restore(hass, {"last_heard": now - 120, "trip": trip, "stay": None})
     hass.set_state(CoreState.starting)
@@ -389,3 +414,90 @@ async def test_unknown_person_still_restores_nothing(hass: HomeAssistant) -> Non
     hass.states.async_set(ALEX, STATE_UNKNOWN, {})
     await setup_entries(hass, person_entry(ALEX))
     assert hass.states.get(STATUS).state == STATE_UNKNOWN
+
+
+def record(hass: HomeAssistant, *entity_ids: str) -> list[tuple[str, str]]:
+    """Return a list that fills with every state the entities publish."""
+    seen: list[tuple[str, str]] = []
+
+    @callback
+    def listener(event: Event[EventStateChangedData]) -> None:
+        new = event.data["new_state"]
+        if event.data["entity_id"] in entity_ids and new is not None:
+            seen.append((event.data["entity_id"], new.state))
+
+    hass.bus.async_listen(EVENT_STATE_CHANGED, listener)
+    return seen
+
+
+def set_up_late(platform: ModuleType) -> Any:
+    """Return a patch that makes a platform set up after the others."""
+    original = platform.async_setup_entry
+
+    async def late(*args: Any, **kwargs: Any) -> None:
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await original(*args, **kwargs)
+
+    return patch.object(platform, "async_setup_entry", late)
+
+
+@pytest.mark.parametrize("late", [None, number_platform, sensor_platform])
+async def test_no_wrong_status_while_setting_up_after_a_restart(
+    hass: HomeAssistant, late: ModuleType | None
+) -> None:
+    """Regression: judged with the default threshold, arriving soon flashed on.
+
+    About 14 minutes out with a saved threshold of 10, whichever of the
+    threshold and the trip home is set up first.
+    """
+    now = dt_util.utcnow().timestamp()
+    trip = {
+        "since": now - 900,
+        "farthest_m": 30_000,
+        "closest_m": 5_000,
+        "arriving_soon": False,
+        "threshold_s": 600.0,
+    }
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (State(STATUS, "heading_home"), {"last_heard": now - 60, "trip": trip}),
+            (State(THRESHOLD, "10.0"), THRESHOLD_DATA | {"native_value": 10.0}),
+        ],
+    )
+    hass.set_state(CoreState.starting)
+    set_person(hass, ALEX, 5_000)
+    seen = record(hass, STATUS, SOMEONE_SOON)
+    with set_up_late(late) if late is not None else nullcontext():
+        await setup_entries(hass, person_entry(ALEX), group_entry([ALEX]))
+    assert hass.states.get(STATUS).state == "heading_home"
+    assert (STATUS, "arriving_soon") not in seen
+    assert (SOMEONE_SOON, STATE_ON) not in seen
+
+
+async def test_no_wrong_status_while_reloading(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """The same at a reload, when automations are running."""
+    set_person(hass, ALEX, 20_000)
+    alex = person_entry(ALEX)
+    await setup_entries(hass, alex, group_entry([ALEX]))
+    await hass.services.async_call(
+        "number", "set_value", {"entity_id": THRESHOLD, "value": 5}, blocking=True
+    )
+    for east in (17_000.0, 14_000.0, 11_000.0, 8_000.0, 5_000.0):
+        await step(hass, freezer, ALEX, east, seconds=240)
+    await step(hass, freezer, ALEX, 4_000.0, seconds=80)
+    # About 8 minutes at the measured speed; after the reload, with only the
+    # typical speed for 4 km, about 12: within the default 15, not within 5.
+    minutes = int(hass.states.get("sensor.alex_minutes_to_home").state)
+    assert 5 < minutes <= 15
+    assert hass.states.get(STATUS).state == "heading_home"
+    seen = record(hass, STATUS, SOMEONE_SOON)
+    with set_up_late(number_platform):
+        await hass.config_entries.async_reload(alex.entry_id)
+        await hass.async_block_till_done()
+    assert hass.states.get(STATUS).state == "heading_home"
+    assert (STATUS, "arriving_soon") not in seen
+    assert (SOMEONE_SOON, STATE_ON) not in seen

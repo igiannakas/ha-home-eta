@@ -359,14 +359,9 @@ class PersonRuntime:
     # -- controls ----------------------------------------------------------
 
     @callback
-    def set_threshold(self, minutes: float, *, saved: bool = False) -> None:
-        """Set the arriving-soon threshold (from the number entity).
-
-        ``saved`` when it is the value saved before a restart or reload,
-        rather than a change: an arriving soon restored with the trip home
-        was judged with that value and holds.
-        """
-        self.tracker.set_threshold(minutes * 60.0, saved=saved)
+    def set_threshold(self, minutes: float) -> None:
+        """Set the arriving-soon threshold (from the number entity)."""
+        self.tracker.set_threshold(minutes * 60.0)
         self.tracker.tick(dt_util.utcnow().timestamp())
         self._refresh()
 
@@ -577,10 +572,29 @@ class GroupView:
 
     @property
     def status(self) -> PersonStatus | None:
-        """Return the most-home status of any member, None with no data."""
-        return next(
-            (status for status in STATUS_ORDER if self.by_status.get(status)), None
-        )
+        """Return the most-home status of any member.
+
+        Home while anyone is home. Otherwise None while any member has no
+        data (being reloaded, say): they might be the one nearest home, and a
+        status that is wrong for a moment would trigger automations.
+        """
+        if self.persons_home:
+            return PersonStatus.HOME
+        if self.missing or not self.by_status:
+            return None
+        return next(status for status in STATUS_ORDER if self.by_status.get(status))
+
+    @property
+    def someone_arriving_soon(self) -> bool | None:
+        """Return True while any member is arriving soon.
+
+        None while that cannot be ruled out: a member has no data.
+        """
+        if self.arriving_soon:
+            return True
+        if self.missing or not self.by_status:
+            return None
+        return False
 
 
 class GroupRuntime:

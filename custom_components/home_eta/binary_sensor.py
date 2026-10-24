@@ -28,7 +28,10 @@ async def async_setup_entry(
 
 
 class SomeoneArrivingSoonSensor(GroupEntity, BinarySensorEntity):
-    """On while any member is arriving soon by their own threshold."""
+    """On while any member is arriving soon by their own threshold.
+
+    Unknown while it cannot be ruled out: a member has no data.
+    """
 
     def __init__(self, runtime: GroupRuntime) -> None:
         """Initialise."""
@@ -36,9 +39,8 @@ class SomeoneArrivingSoonSensor(GroupEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool | None:
-        """Return True when any member is arriving soon, None with no data."""
-        view = self._runtime.view
-        return None if view.reporting == 0 else bool(view.arriving_soon)
+        """Return True when any member is arriving soon, None when unsure."""
+        return self._runtime.view.someone_arriving_soon
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

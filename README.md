@@ -21,11 +21,11 @@ For a group (named "Home ETA" by default):
 
 | Entity | What it shows |
 | --- | --- |
-| `sensor.home_eta_status` | The most-home status of any member: `home` while anyone is home, else `arriving_soon` if anyone is, and so on. Attributes list the members in each status (`persons_home`, `persons_arriving_soon`, `persons_heading_home`, `persons_away`) and any member without data. |
+| `sensor.home_eta_status` | The most-home status of any member: `home` while anyone is home, else `arriving_soon` if anyone is, and so on. Unknown while nobody is home and a member has no data (being reloaded, say), since they could change the answer. Attributes list the members in each status (`persons_home`, `persons_arriving_soon`, `persons_heading_home`, `persons_away`) and any member without data. |
 | `sensor.home_eta_expected_home` | When the first member heading home is expected; unknown while nobody is. Attributes: who that is, everyone heading home with their expected time, who is home, and any member without data. |
 | `sensor.home_eta_minutes_to_home` | Minutes until then. |
-| `binary_sensor.home_eta_someone_arriving_soon` | On while any member is arriving soon by their own threshold. Its `persons` and `names` attributes say who; unknown while no member has data. |
-| `sensor.home_eta_near_home` | The nearest member's near home (each by their own radius and fade); 100 % while anyone is home. Attributes: who that is and their distance, and who is home. |
+| `binary_sensor.home_eta_someone_arriving_soon` | On while any member is arriving soon by their own threshold. Its `persons` and `names` attributes say who; unknown while nobody is and a member has no data. |
+| `sensor.home_eta_near_home` | The highest near home of any member, each by their own radius and fade (so not always the nearest member); 100 % while anyone is home. Attributes: who that is and their distance, and who is home. |
 
 All but the threshold are unknown until the person's first location arrives.
 
@@ -55,7 +55,7 @@ Every position report from the phone gives a straight-line distance to the zone.
 
 The status becomes `heading_home` when the person has come at least 20 % (and 500 m) closer than the farthest point since they last stayed somewhere, and is still closing; or the moment they enter a zone around home (see rings below). That is scale-invariant: 500 m on a walk back from town, a few kilometres on a drive back from a friend's, 7 km on the way back from central London. Driving round to park, or walking about somewhere far away, is not mistaken for it.
 
-It stays on until they get home, or until the trip clearly is not one: they stay at one place for 20 minutes (a quiet phone counts: a still report, then silence; so do indoor positions bouncing a few hundred metres), they move back out beyond the closest point by 500 m or 15 % of the distance, whichever is more, they leave the zone around home that started it, or their phone goes silent well past the expected arrival. Each zone around home starts a trip home once per outing, so a road along a zone's edge does not keep restarting it. Trips home and stays are kept across restarts.
+It lasts until they get home, or until the trip clearly is not one: they stay at one place for 20 minutes (a quiet phone counts: a still report, then silence; so do indoor positions bouncing a few hundred metres), they move back out beyond the closest point by 500 m or 15 % of the distance, whichever is more, they leave the zone around home that started it, or their phone goes silent well past the expected arrival. Each zone around home starts a trip home once per outing, so a road along a zone's edge does not keep restarting it. Trips home and stays are kept across restarts by the status sensor, so not while it is disabled.
 
 ### Expected home
 
@@ -132,6 +132,8 @@ Version 2.0 keeps only what turned out to be useful, and per person:
 - A trip home in progress, or a stay somewhere, during the upgrade restart is not carried over.
 
 ## Automations
+
+While Home Assistant starts or a person's entry reloads, their entities are briefly unavailable and the group's may be unknown. For a trigger that should fire only on a real change, add `not_from: [unknown, unavailable]`.
 
 Warm a room once the first person heading home is closer than the 45 minutes it takes to heat up:
 

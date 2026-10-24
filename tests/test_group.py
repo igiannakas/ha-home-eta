@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNKNOWN
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    EVENT_STATE_CHANGED,
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNKNOWN,
+)
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.util import dt as dt_util
 import pytest
@@ -135,7 +140,10 @@ async def test_missing_members_reported(hass: HomeAssistant) -> None:
     alex = person_entry(ALEX)
     await setup_entries(hass, alex, group_entry([ALEX, SAM]))
     assert hass.states.get(EXPECTED).attributes["missing_members"] == [SAM]
-    assert hass.states.get(SOMEONE_SOON).state == STATE_OFF
+    # Sam could be the one home or arriving soon: the group cannot tell.
+    assert hass.states.get(SOMEONE_SOON).state == STATE_UNKNOWN
+    assert hass.states.get(STATUS).state == STATE_UNKNOWN
+    assert hass.states.get(STATUS).attributes["persons_away"] == [ALEX]
 
     await hass.config_entries.async_unload(alex.entry_id)
     await hass.async_block_till_done()
@@ -146,6 +154,39 @@ async def test_missing_members_reported(hass: HomeAssistant) -> None:
     assert status.state == STATE_UNKNOWN
     assert status.attributes["missing_members"] == [ALEX, SAM]
     assert hass.states.get(NEAR).state == STATE_UNKNOWN
+
+
+async def test_a_member_reloading_never_shows_a_wrong_status(
+    hass: HomeAssistant,
+) -> None:
+    """Regression: home -> away -> home while the member at home reloaded."""
+    set_person(hass, ALEX, None, zones=("zone.home",))
+    set_person(hass, SAM, 5_000)
+    alex = person_entry(ALEX)
+    await setup_entries(hass, alex, person_entry(SAM), group_entry([ALEX, SAM]))
+    assert hass.states.get(STATUS).state == "home"
+    assert hass.states.get(SOMEONE_SOON).state == STATE_OFF
+    seen: list[tuple[str, str]] = []
+
+    @callback
+    def listener(event: Event[EventStateChangedData]) -> None:
+        new = event.data["new_state"]
+        if event.data["entity_id"] in (STATUS, SOMEONE_SOON) and new is not None:
+            seen.append((event.data["entity_id"], new.state))
+
+    hass.bus.async_listen(EVENT_STATE_CHANGED, listener)
+    await hass.config_entries.async_reload(alex.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get(STATUS).state == "home"
+    assert (STATUS, "away") not in seen
+    assert (SOMEONE_SOON, STATE_ON) not in seen
+    assert hass.states.get(SOMEONE_SOON).state == STATE_OFF
+
+    # A member at home settles it even while another has no data.
+    hass.states.async_remove(SAM)
+    await hass.async_block_till_done()
+    assert hass.states.get(STATUS).state == "home"
+    assert hass.states.get(SOMEONE_SOON).state == STATE_UNKNOWN
 
 
 async def test_member_without_a_location_yet_is_missing(hass: HomeAssistant) -> None:

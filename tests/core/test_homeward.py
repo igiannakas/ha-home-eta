@@ -415,7 +415,7 @@ def test_restore_resumes_and_then_ends_like_any_trip() -> None:
     # Saved again as it was, with when the person was last heard from: a
     # second restart before any fix keeps it.
     assert tracker.restore_data() == HomewardRestore(
-        T0 + 10 * MIN, HomewardTrip(T0, 30_000, 20_000)
+        T0 + 10 * MIN, HomewardTrip(T0, 30_000, 20_000, threshold_s=15 * MIN)
     )
     trip_s = snap.arrival - (T0 + 10 * MIN)
     grace = max(P.homeward_overdue_s, P.homeward_overdue_ratio * trip_s)
@@ -743,7 +743,7 @@ def test_arriving_soon_survives_a_restart() -> None:
 def test_saved_data_round_trips() -> None:
     data = HomewardRestore(
         T0,
-        HomewardTrip(T0 - 600, 30_000, 20_000, arriving_soon=True),
+        HomewardTrip(T0 - 600, 30_000, 20_000, arriving_soon=True, threshold_s=600),
         HomewardStay(T0 - 3_600, *to_latlon(500, 0), 500.0),
     )
     assert HomewardRestore.from_dict(data.as_dict()) == data
@@ -780,6 +780,15 @@ def test_unusable_saved_data_restores_nothing(value: object) -> None:
     assert HomewardRestore.from_dict(value) is None
 
 
+@pytest.mark.parametrize("threshold", [-60, 0, "soon", math.nan, True])
+def test_an_unusable_saved_threshold_is_dropped(threshold: object) -> None:
+    data = HomewardRestore.from_dict(
+        {"last_heard": T0, "trip": {**GOOD_TRIP, "threshold_s": threshold}}
+    )
+    assert data is not None
+    assert data.trip == HomewardTrip(T0, 30_000, 20_000)
+
+
 def test_a_bad_part_of_saved_data_is_dropped() -> None:
     data = HomewardRestore.from_dict(
         {"last_heard": T0, "trip": {**GOOD_TRIP, "since": None}, "stay": GOOD_STAY}
@@ -787,41 +796,65 @@ def test_a_bad_part_of_saved_data_is_dropped() -> None:
     assert data == HomewardRestore(T0, None, HomewardStay(T0, HOME_LAT, HOME_LON, 5))
 
 
-def restored_at_5_km(soon: bool) -> HomewardTracker:
-    """Return a tracker with a trip home restored 5 km out (about 14 min left)."""
-    tracker = HomewardTracker(P, TARGET)
-    data = HomewardRestore(T0, HomewardTrip(T0 - 600, 30_000, 5_000, soon))
-    assert tracker.restore(data, T0, 5_000)
-    return tracker
-
-
-@pytest.mark.parametrize("threshold_first", [True, False])
-def test_the_saved_threshold_keeps_a_restored_arriving_soon(
-    threshold_first: bool,
+def restore_at_5_km(
+    tracker: HomewardTracker, soon: bool, threshold_s: float | None = 10 * MIN
 ) -> None:
-    """Regression: a non-default threshold applied at setup turned it off."""
-    if threshold_first:
-        tracker = HomewardTracker(P, TARGET)
-        tracker.set_threshold(10 * MIN, saved=True)
-        data = HomewardRestore(T0, HomewardTrip(T0 - 600, 30_000, 5_000, True))
-        assert tracker.restore(data, T0, 5_000)
-    else:
-        tracker = restored_at_5_km(True)
-        tracker.set_threshold(10 * MIN, saved=True)
+    """Restore a trip home 5 km out (about 14 minutes left at a typical speed)."""
+    trip = HomewardTrip(T0 - 600, 30_000, 5_000, soon, threshold_s)
+    assert tracker.restore(HomewardRestore(T0, trip), T0, 5_000)
     tracker.tick(T0 + 1, None)
+
+
+@pytest.mark.parametrize("soon", [True, False])
+def test_a_restored_trip_keeps_its_threshold_until_the_persons_arrives(
+    soon: bool,
+) -> None:
+    """Regression: judged with the default first, it showed the wrong state.
+
+    The person's threshold is set up separately, after or before the trip.
+    """
+    tracker = HomewardTracker(P, TARGET)
+    restore_at_5_km(tracker, soon)
+    assert tracker.threshold_s == 10 * MIN
     assert due_in(tracker, T0 + 1) > 10 * MIN
-    assert tracker.arriving_soon
-    # A change by the user afterwards is judged afresh.
-    tracker.set_threshold(11 * MIN)
+    assert tracker.arriving_soon is soon
+    tracker.set_threshold(10 * MIN)  # the person's own, the same
+    tracker.tick(T0 + 2, None)
+    assert tracker.arriving_soon is soon
+
+
+@pytest.mark.parametrize("soon", [True, False])
+def test_the_persons_threshold_set_first_stands(soon: bool) -> None:
+    tracker = HomewardTracker(P, TARGET)
+    tracker.set_threshold(10 * MIN)
+    restore_at_5_km(tracker, soon)
+    assert tracker.arriving_soon is soon
+
+
+def test_a_different_threshold_judges_a_restored_trip_afresh() -> None:
+    """Changed meanwhile (or saved by 2.1.0 without one): judged again."""
+    for threshold_s in (10 * MIN, None):
+        tracker = HomewardTracker(P, TARGET)
+        tracker.set_threshold(12 * MIN)
+        restore_at_5_km(tracker, True, threshold_s)
+        assert not tracker.arriving_soon
+    tracker = HomewardTracker(P, TARGET)
+    restore_at_5_km(tracker, True)
+    tracker.set_threshold(12 * MIN)
     tracker.tick(T0 + 2, None)
     assert not tracker.arriving_soon
 
 
-def test_the_saved_threshold_rejudges_one_judged_with_the_default() -> None:
-    """Restored off, judged on with the default 15 minutes, then 10 arrives."""
-    tracker = restored_at_5_km(False)
-    tracker.tick(T0 + 1, None)
+def test_undoing_a_fix_after_a_new_threshold_judges_afresh() -> None:
+    """Regression: the undo brought back an arriving soon judged with the old one."""
+    tracker, phone = out_of_home()
+    phone.at(2_000, speed=-1.3)
+    phone.at(1_200, after_s=10 * MIN, speed=1.3)
     assert tracker.arriving_soon
-    tracker.set_threshold(10 * MIN, saved=True)
-    tracker.tick(T0 + 2, None)
+    saved = tracker.save()
+    tracker.set_threshold(5 * MIN)
+    phone.wait(0.0, speed=1.3)
     assert not tracker.arriving_soon
+    tracker.load(saved)
+    assert not tracker.arriving_soon
+    assert tracker.threshold_s == 5 * MIN
