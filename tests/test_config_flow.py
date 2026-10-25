@@ -14,7 +14,6 @@ from custom_components.home_eta.const import (
     CONF_ADVANCED,
     CONF_ENTRY_TYPE,
     CONF_MEMBERS,
-    CONF_NEAR_HOME_FADE_AFTER_MIN,
     CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
     CONF_ZONE,
@@ -22,12 +21,15 @@ from custom_components.home_eta.const import (
     ENTRY_TYPE_GROUP,
     ENTRY_TYPE_PERSON,
 )
-from custom_components.home_eta.migration import CONFIG_MINOR_VERSION
+from custom_components.home_eta.migration import (
+    CONFIG_MINOR_VERSION,
+    RETIRED_NEAR_HOME_FADE,
+)
 from tests.helpers import ALEX, SAM, group_entry, person_entry, set_person
 
 pytestmark = pytest.mark.usefixtures("zones")
 
-NEAR_DEFAULTS = {CONF_NEAR_HOME_RADIUS_M: 3_000, CONF_NEAR_HOME_FADE_AFTER_MIN: 90}
+NEAR_DEFAULTS = {CONF_NEAR_HOME_RADIUS_M: 3_000}
 ADVANCED_DEFAULTS = {
     "max_gps_accuracy_m": 150,
     "speed_filter_tau_s": 300,
@@ -71,7 +73,6 @@ async def test_add_person(hass: HomeAssistant) -> None:
             CONF_PERSON: ALEX,
             CONF_ZONE: "zone.home",
             CONF_NEAR_HOME_RADIUS_M: 4_000.0,
-            CONF_NEAR_HOME_FADE_AFTER_MIN: 60.0,
         },
     )
     await hass.async_block_till_done()
@@ -82,10 +83,7 @@ async def test_add_person(hass: HomeAssistant) -> None:
         CONF_PERSON: ALEX,
         CONF_ZONE: "zone.home",
     }
-    assert result["options"] == {
-        CONF_NEAR_HOME_RADIUS_M: 4_000,
-        CONF_NEAR_HOME_FADE_AFTER_MIN: 60,
-    }
+    assert result["options"] == {CONF_NEAR_HOME_RADIUS_M: 4_000}
     entry = result["result"]
     assert entry.unique_id == f"{ALEX}|zone.home"
     assert entry.minor_version == CONFIG_MINOR_VERSION
@@ -153,8 +151,6 @@ async def test_person_validation(hass: HomeAssistant) -> None:
     [
         (CONF_NEAR_HOME_RADIUS_M, 999),
         (CONF_NEAR_HOME_RADIUS_M, 30_001),
-        (CONF_NEAR_HOME_FADE_AFTER_MIN, -5),
-        (CONF_NEAR_HOME_FADE_AFTER_MIN, 721),
     ],
 )
 async def test_person_near_home_out_of_range(
@@ -165,6 +161,17 @@ async def test_person_near_home_out_of_range(
     with pytest.raises(InvalidData):
         await hass.config_entries.flow.async_configure(
             flow_id, {CONF_PERSON: ALEX, CONF_ZONE: "zone.home", field: value}
+        )
+
+
+async def test_person_form_has_no_near_home_fade(hass: HomeAssistant) -> None:
+    """Near home no longer fades after a long stay, so there is nothing to set."""
+    set_person(hass, ALEX, 5_000)
+    flow_id = await start(hass, "person")
+    with pytest.raises(InvalidData):
+        await hass.config_entries.flow.async_configure(
+            flow_id,
+            {CONF_PERSON: ALEX, CONF_ZONE: "zone.home", RETIRED_NEAR_HOME_FADE: 90},
         )
 
 
@@ -249,15 +256,11 @@ async def test_person_options(hass: HomeAssistant) -> None:
     result, entry = await open_person_options(
         hass, {**NEAR_DEFAULTS, CONF_NEAR_HOME_RADIUS_M: 4_000}
     )
-    assert suggested(result) == {
-        CONF_NEAR_HOME_RADIUS_M: 4_000,
-        CONF_NEAR_HOME_FADE_AFTER_MIN: 90,
-    }
+    assert suggested(result) == {CONF_NEAR_HOME_RADIUS_M: 4_000}
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         {
             CONF_NEAR_HOME_RADIUS_M: 5_000,
-            CONF_NEAR_HOME_FADE_AFTER_MIN: 0,
             CONF_ADVANCED: {**ADVANCED_DEFAULTS, "max_gps_accuracy_m": 100},
         },
     )
@@ -266,17 +269,16 @@ async def test_person_options(hass: HomeAssistant) -> None:
     # Only the changed advanced value is stored; the rest follow the defaults.
     assert dict(entry.options) == {  # type: ignore[attr-defined]
         CONF_NEAR_HOME_RADIUS_M: 5_000,
-        CONF_NEAR_HOME_FADE_AFTER_MIN: 0,
         CONF_ADVANCED: {"max_gps_accuracy_m": 100},
     }
     # Reloaded with the new options.
     runtime = entry.runtime_data  # type: ignore[attr-defined]
     assert runtime.config.params.max_gps_accuracy_m == 100
     assert runtime.config.near_home.radius_m == 5_000
-    assert runtime.config.near_home.fade_after_s is None
     near = hass.states.get("sensor.alex_near_home")
     assert near.attributes["radius_m"] == 5_000
-    assert near.attributes["fade_after_min"] is None
+    assert "fade_after_min" not in near.attributes
+    assert hass.states.get("binary_sensor.alex_nearby").attributes["radius_m"] == 5_000
 
 
 async def test_unusable_advanced_combination_is_a_form_error(

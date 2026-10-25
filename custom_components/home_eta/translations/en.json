@@ -23,19 +23,17 @@
           "name": "Used for the device and its entity IDs.",
           "zone": "Must match the zone the people are tracked to."
         },
-        "description": "Combines several people: when the first of them heading home is expected, whether anyone is arriving soon, and how near home the nearest is.",
+        "description": "Combines several people: when the first of them heading home is expected, whether anyone is arriving soon, close to home or nearby, and how near home the nearest is.",
         "title": "Add a group"
       },
       "person": {
         "data": {
-          "near_home_fade_after_min": "Near home fades after",
           "near_home_radius_m": "Near-home radius",
           "person": "Person",
           "zone": "Destination zone"
         },
         "data_description": {
-          "near_home_fade_after_min": "After the person has stayed at one place this long, Near home fades to 0 % over an hour, so an afternoon at a friend's nearby does not keep the house warm throughout. 0 never fades.",
-          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way the person is going.",
+          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way the person is going. Within this distance the person is also Nearby.",
           "person": "Uses the person's phone location.",
           "zone": "Usually Home."
         },
@@ -53,8 +51,52 @@
   },
   "entity": {
     "binary_sensor": {
+      "close_to_home": {
+        "name": "Close to home",
+        "state_attributes": {
+          "distance_m": {
+            "name": "Distance"
+          },
+          "within_m": {
+            "name": "Within"
+          }
+        }
+      },
+      "nearby": {
+        "name": "Nearby",
+        "state_attributes": {
+          "distance_m": {
+            "name": "Distance"
+          },
+          "radius_m": {
+            "name": "Radius"
+          }
+        }
+      },
       "someone_arriving_soon": {
         "name": "Someone arriving soon",
+        "state_attributes": {
+          "names": {
+            "name": "Names"
+          },
+          "persons": {
+            "name": "People"
+          }
+        }
+      },
+      "someone_close_to_home": {
+        "name": "Someone close to home",
+        "state_attributes": {
+          "names": {
+            "name": "Names"
+          },
+          "persons": {
+            "name": "People"
+          }
+        }
+      },
+      "someone_nearby": {
+        "name": "Someone nearby",
         "state_attributes": {
           "names": {
             "name": "Names"
@@ -107,9 +149,6 @@
         "state_attributes": {
           "distance_m": {
             "name": "Distance"
-          },
-          "fade_after_min": {
-            "name": "Fades after"
           },
           "person": {
             "name": "Person"
@@ -260,13 +299,11 @@
       "init": {
         "data": {
           "members": "People",
-          "near_home_fade_after_min": "Near home fades after",
           "near_home_radius_m": "Near-home radius"
         },
         "data_description": {
           "members": "People tracked to this group's zone.",
-          "near_home_fade_after_min": "After the person has stayed at one place this long, Near home fades to 0 % over an hour, so an afternoon at a friend's nearby does not keep the house warm throughout. 0 never fades.",
-          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way the person is going."
+          "near_home_radius_m": "Near home is 100 % within 800 m of the zone centre and falls to 0 % at this distance, whichever way the person is going. Within this distance the person is also Nearby."
         },
         "sections": {
           "advanced": {

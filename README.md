@@ -2,7 +2,7 @@
 
 A Home Assistant integration that says who is heading home, when they will get there and how near home they are, from the Companion app's phone location. It works whether you walk, take the train or drive, needs no map or routing service, and never reads step counters. It was built to warm the house on the way home.
 
-Each person is added on their own, with their own entities and their own "arriving soon" threshold. A separate **group** entry combines people heading to the same zone: who is expected first, whether anyone is arriving soon, and how near the nearest is.
+Each person is added on their own, with their own entities and their own "arriving soon" threshold. A separate **group** entry combines people heading to the same zone: who is expected first, whether anyone is arriving soon, whether anyone is close to home or nearby, and how near the nearest is.
 
 ## What you get
 
@@ -15,7 +15,9 @@ For each person (entity IDs shown for a person called "person"):
 | `sensor.person_minutes_to_home` | Minutes until then. |
 | `number.person_arriving_soon_threshold` | Minutes out that count as arriving soon (default 15). |
 | `sensor.person_distance_to_home` | Straight-line distance to the zone centre; 0 at home. |
-| `sensor.person_near_home` | How near home they are, 0-100 %, whichever way they are going: 100 % at home or within 800 m, 0 % at their near-home radius (3 km by default). It fades to 0 % after a long stay at one place. |
+| `sensor.person_near_home` | How near home they are, 0-100 %, whichever way they are going: 100 % at home or within 800 m, 0 % at their near-home radius (3 km by default), however long they stay there. |
+| `binary_sensor.person_close_to_home` | On while they are home or within 800 m of the zone centre; off again only beyond 950 m (see Near home). Attributes: their distance and the 800 m. |
+| `binary_sensor.person_nearby` | On while they are home or within their near-home radius; off again only 150 m beyond it. Attributes: their distance and the radius. |
 | `sensor.person_typical_speeds` | How many trips home the person's typical speeds were learned from (see below). Attributes: the two learned tables, and what each of the latest trips changed in them. Diagnostic. |
 | `button.person_relearn_typical_speeds` | Learn the typical speeds afresh from the recorder's history. |
 
@@ -27,9 +29,11 @@ For a group (named "Home ETA" by default):
 | `sensor.home_eta_expected_home` | When the first member heading home is expected; unknown while nobody is. Attributes: who that is, everyone heading home with their expected time, who is home, and any member without data. |
 | `sensor.home_eta_minutes_to_home` | Minutes until then. |
 | `binary_sensor.home_eta_someone_arriving_soon` | On while any member is arriving soon by their own threshold. Its `persons` and `names` attributes say who; unknown while nobody is and a member has no data. |
-| `sensor.home_eta_near_home` | The highest near home of any member, each by their own radius and fade (so not always the nearest member); 100 % while anyone is home. Attributes: who that is and their distance, and who is home. |
+| `binary_sensor.home_eta_someone_close_to_home` | On while any member is home or within 800 m. Its `persons` and `names` attributes say who; unknown while nobody is and a member has no data or no known distance yet. |
+| `binary_sensor.home_eta_someone_nearby` | On while any member is home or within their own near-home radius. Attributes and unknown as for someone close to home. |
+| `sensor.home_eta_near_home` | The highest near home of any member, each by their own radius (so not always the nearest member); 100 % while anyone is home. Attributes: who that is and their distance, and who is home. |
 
-All but the threshold and the typical speeds are unknown until the person's first location arrives.
+All but the threshold and the typical speeds are unknown until the person's first location arrives. The group's sensors are unknown rather than off while a member could change the answer, so an automation that must not act on a guess can wait for on or off.
 
 The status is one stage of the way home at a time, most home first:
 
@@ -82,7 +86,9 @@ On a trip home, the status becomes `arriving_soon` once the expected arrival is 
 
 ### Near home
 
-Near home is for keeping the house a little warmer while someone is close by, in any direction, since a short trip home is over before any room could warm up. It is 100 % within 800 m and falls to 0 % at the person's near-home radius. After someone has stayed at one place for 90 minutes it fades to 0 % over an hour, so an afternoon at a café round the corner does not keep the house warm throughout. The radius and the fade are in each person's options.
+Near home is for keeping the house a little warmer while someone is close by, in any direction, since a short trip home is over before any room could warm up. It is 100 % within 800 m and falls to 0 % at the person's near-home radius. It does not fade however long someone stays close by: the longer they have been out, the sooner they are likely to come back, so a stay round the corner is when the house most needs to be ready. The radius is in each person's options.
+
+Close to home and nearby are the on/off versions: close to home comes on within 800 m (where near home reaches 100 %), nearby within the radius (where near home rises above 0 %). Each goes off again only 150 m further out, about the worst GPS accuracy used, so a phone lying still near the edge does not switch it on and off with every report; near home itself has no such margin, so near them the two can briefly disagree. Both are on at home, and unknown while the distance is not known: no usable position since leaving home, none yet, or the zone just moved. Close to home always implies nearby.
 
 ### Rings around home
 
@@ -122,10 +128,10 @@ Requires Home Assistant 2026.10 or later.
 
 In **Settings → Devices & services → Add integration → Home ETA**:
 
-1. Choose **Person** once for each person. Pick the person, the destination zone (usually Home), the **near-home radius** (3 km by default) and after how long at one place **near home fades** (90 minutes; 0 never fades).
+1. Choose **Person** once for each person. Pick the person, the destination zone (usually Home) and the **near-home radius** (3 km by default).
 2. Choose **Group** and pick the people to combine.
 
-Each person's **Configure** button changes the near-home settings and has an **Advanced** section: worst usable GPS accuracy, speed smoothing, arriving-soon distance, and how long until the measured speed is stale. Only advanced values you change are stored; the rest follow the defaults of the installed version.
+Each person's **Configure** button changes the near-home radius and has an **Advanced** section: worst usable GPS accuracy, speed smoothing, arriving-soon distance, and how long until the measured speed is stale. Only advanced values you change are stored; the rest follow the defaults of the installed version.
 
 Renaming a person or a zone is followed automatically. Removing a person takes them out of every group; a group left with nobody in it raises a repair.
 
@@ -133,13 +139,19 @@ On iPhones, make sure the Companion app has location set to **Always** with back
 
 ## Upgrading
 
+### From 2.2
+
+- **Near home no longer fades** after a long stay at one place: someone at a café round the corner stays at 100 % however long they are there. The **near home fades** setting is gone from each person's options and is removed from their entry on upgrade. The near home sensor's `fade_after_min` attribute is gone.
+- **New binary sensors**: each person gains `binary_sensor.person_close_to_home` (home or within 800 m) and `binary_sensor.person_nearby` (home or within their near-home radius); a group gains `binary_sensor.home_eta_someone_close_to_home` and `binary_sensor.home_eta_someone_nearby`. Nothing to set up.
+- **Fixed**: after leaving home, distance to home and near home stayed at 0 and 100 % until a usable position arrived (none at all from a tracker without GPS). They are now unknown until then.
+
 ### From 2.1
 
 Each person gains `sensor.person_typical_speeds` and `button.person_relearn_typical_speeds`. At the first start after upgrading, the trips home in the recorder's history are learned from in the background, and the expected arrival uses what was learned from then on. Nothing to set up.
 
 ### From 2.0
 
-Each person's heading-home and arriving-soon binary sensors are now the states `heading_home` and `arriving_soon` of `sensor.person_status`, which also says `home` and `away`. The binary sensors are removed on upgrade; in an automation, `binary_sensor.person_heading_home` being on becomes the status being `heading_home` or `arriving_soon`, and arriving soon being on becomes the status being `arriving_soon`. The threshold now lives only on its number entity (the `threshold_min` attribute is gone). A group gains `sensor.home_eta_status`. A trip home in progress, or a stay somewhere, during the upgrade restart is not carried over, so near home may stay high for up to another 90 minutes for someone already staying near home.
+Each person's heading-home and arriving-soon binary sensors are now the states `heading_home` and `arriving_soon` of `sensor.person_status`, which also says `home` and `away`. The binary sensors are removed on upgrade; in an automation, `binary_sensor.person_heading_home` being on becomes the status being `heading_home` or `arriving_soon`, and arriving soon being on becomes the status being `arriving_soon`. The threshold now lives only on its number entity (the `threshold_min` attribute is gone). A group gains `sensor.home_eta_status`. A trip home in progress, or a stay somewhere, during the upgrade restart is not carried over.
 
 ### From 1.x
 
@@ -148,8 +160,8 @@ Version 2.0 keeps only what turned out to be useful, and per person:
 - **Removed**: the kinematic and past-trips ETAs, closing speed, ETA confidence, the approach state, and the group's first-arrival sensors. Their entities are deleted on upgrade. Use expected home, minutes to home and arriving soon instead; they now exist for each person as well as for the group.
 - **Arriving soon** now follows heading home and expected home: it comes on when minutes to home reaches the threshold (or within 800 m) and stays on until the trip home ends.
 - **Learning from past trips** is gone: learned trips are deleted on upgrade, and so are the `reset_history` and `export_history` actions.
-- **Options**: the activity, reference travel-time and "zones that end a trip" options are gone, and so is **Slowest closing speed** in Advanced. A group's near-home radius and fade move to each of its members.
-- **Attributes** gone with them: heading home's `expected_at` and `minutes` (now sensors of their own) and `staying_since` (now on near home); the group expected home's `minutes`, `reason`, `speed_source` and `distance_m`, and each member's `reason` and `speed_source` (on the person's own entities now); the group near home's `staying_since`, `radius_m` and `fade_after_min` (on each person's near home now).
+- **Options**: the activity, reference travel-time and "zones that end a trip" options are gone, and so is **Slowest closing speed** in Advanced. A group's near-home radius moves to each of its members (its fade setting is gone since 2.3).
+- **Attributes** gone with them: heading home's `expected_at` and `minutes` (now sensors of their own) and `staying_since` (now on near home); the group expected home's `minutes`, `reason`, `speed_source` and `distance_m`, and each member's `reason` and `speed_source` (on the person's own entities now); the group near home's `staying_since` and `radius_m` (on each person's near home now) and `fade_after_min`.
 - A trip home in progress, or a stay somewhere, during the upgrade restart is not carried over.
 
 ## Automations
@@ -202,6 +214,27 @@ actions:
       entity_id: climate.hallway
     data:
       temperature: 18
+```
+
+Or in two steps, with the binary sensors: one temperature while anyone is nearby, the full one while anyone is close to home. Changes to unknown are left out, so a member reloading changes nothing; the change back is not, so nothing that happened meanwhile is missed. One report can change both sensors at once, hence `queued`:
+
+```yaml
+mode: queued
+triggers:
+  - trigger: state
+    entity_id:
+      - binary_sensor.home_eta_someone_nearby
+      - binary_sensor.home_eta_someone_close_to_home
+    not_to: [unknown, unavailable]
+actions:
+  - action: climate.set_temperature
+    target:
+      entity_id: climate.hallway
+    data:
+      temperature: >-
+        {{ 20 if is_state('binary_sensor.home_eta_someone_close_to_home', 'on')
+           else 19 if is_state('binary_sensor.home_eta_someone_nearby', 'on')
+           else 16 }}
 ```
 
 Announce who is nearly home, each person by their own threshold:

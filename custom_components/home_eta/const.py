@@ -21,7 +21,6 @@ CONF_ZONE: Final = "zone"
 
 # Person entries: options
 CONF_NEAR_HOME_RADIUS_M: Final = "near_home_radius_m"
-CONF_NEAR_HOME_FADE_AFTER_MIN: Final = "near_home_fade_after_min"
 CONF_ADVANCED: Final = "advanced"
 
 # Advanced options map one-to-one onto EstimatorParams fields.
@@ -36,11 +35,9 @@ DEFAULT_NEAR_HOME_RADIUS_M: Final = 3_000
 MIN_NEAR_HOME_RADIUS_M: Final = 1_000
 MAX_NEAR_HOME_RADIUS_M: Final = 30_000
 NEAR_HOME_FULL_M: Final = 800.0
-"""Near home is 100 % at this distance or closer."""
-DEFAULT_NEAR_HOME_FADE_AFTER_MIN: Final = 90
-MAX_NEAR_HOME_FADE_AFTER_MIN: Final = 720
-NEAR_HOME_FADE_MIN: Final = 60
-"""After the fade starts, near home falls to 0 over this many minutes."""
+"""Near home is 100 % at this distance or closer: the person is close to home."""
+NEAR_HOME_OFF_MARGIN_M: Final = 150.0
+"""Close to home and nearby go off only this far beyond 800 m or the radius."""
 
 # Group entries: options
 CONF_MEMBERS: Final = "members"
@@ -75,5 +72,9 @@ KEY_MINUTES: Final = "minutes_to_home"
 KEY_DISTANCE: Final = "distance_to_home"
 KEY_NEAR_HOME: Final = "near_home"
 KEY_SOMEONE_SOON: Final = "someone_arriving_soon"
+KEY_CLOSE_TO_HOME: Final = "close_to_home"
+KEY_NEARBY: Final = "nearby"
+KEY_SOMEONE_CLOSE: Final = "someone_close_to_home"
+KEY_SOMEONE_NEARBY: Final = "someone_nearby"
 KEY_TYPICAL_SPEEDS: Final = "typical_speeds"
 KEY_RELEARN_SPEEDS: Final = "relearn_typical_speeds"

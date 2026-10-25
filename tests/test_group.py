@@ -23,8 +23,10 @@ EXPECTED = "sensor.home_eta_expected_home"
 MINUTES = "sensor.home_eta_minutes_to_home"
 NEAR = "sensor.home_eta_near_home"
 SOMEONE_SOON = "binary_sensor.home_eta_someone_arriving_soon"
+SOMEONE_CLOSE = "binary_sensor.home_eta_someone_close_to_home"
+SOMEONE_NEARBY = "binary_sensor.home_eta_someone_nearby"
 STATUS = "sensor.home_eta_status"
-ALL = (STATUS, EXPECTED, MINUTES, NEAR, SOMEONE_SOON)
+ALL = (STATUS, EXPECTED, MINUTES, NEAR, SOMEONE_SOON, SOMEONE_CLOSE, SOMEONE_NEARBY)
 
 pytestmark = pytest.mark.usefixtures("zones")
 
@@ -133,6 +135,86 @@ async def test_near_home_uses_each_members_own_radius(hass: HomeAssistant) -> No
     assert near.state == "56"
     assert near.attributes["person"] == ALEX
     assert near.attributes["distance_m"] == 4_000
+
+
+async def test_someone_close_and_nearby(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    set_person(hass, ALEX, 30_000)
+    set_person(hass, SAM, 2_000)
+    await setup_entries(
+        hass,
+        person_entry(ALEX, options={CONF_NEAR_HOME_RADIUS_M: 8_000}),
+        person_entry(SAM),
+        group_entry([ALEX, SAM]),
+    )
+    close = hass.states.get(SOMEONE_CLOSE)
+    assert close.state == STATE_OFF
+    assert close.attributes["persons"] == []
+    nearby = hass.states.get(SOMEONE_NEARBY)
+    assert nearby.state == STATE_ON
+    assert nearby.attributes["persons"] == [SAM]
+    assert nearby.attributes["names"] == ["Sam"]
+
+    # Sam goes further than their own 3 km; Alex comes within their 8 km.
+    await step(hass, freezer, SAM, 3_500, seconds=300)
+    await step(hass, freezer, ALEX, 7_000, seconds=1_800)
+    assert hass.states.get(SOMEONE_NEARBY).attributes["persons"] == [ALEX]
+    assert hass.states.get(SOMEONE_CLOSE).state == STATE_OFF
+
+    await step(hass, freezer, SAM, 600, seconds=600)
+    close = hass.states.get(SOMEONE_CLOSE)
+    assert close.state == STATE_ON
+    assert close.attributes["persons"] == [SAM]
+    assert close.attributes["names"] == ["Sam"]
+    assert hass.states.get(SOMEONE_NEARBY).attributes["persons"] == [ALEX, SAM]
+
+    # Home counts as close and nearby, wherever home's centre is.
+    await step(hass, freezer, ALEX, None, zones=("zone.home",))
+    assert hass.states.get(SOMEONE_CLOSE).attributes["persons"] == [ALEX, SAM]
+
+    await step(hass, freezer, ALEX, 40_000, seconds=3_600)
+    await step(hass, freezer, SAM, 40_000, seconds=3_600)
+    assert hass.states.get(SOMEONE_CLOSE).state == STATE_OFF
+    assert hass.states.get(SOMEONE_NEARBY).state == STATE_OFF
+
+
+async def test_someone_close_is_unknown_until_it_can_be_ruled_out(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A member with no data, or no distance yet, could be the one close by."""
+    set_person(hass, ALEX, 30_000)
+    alex = person_entry(ALEX)
+    await setup_entries(hass, alex, group_entry([ALEX, SAM]))
+    assert hass.states.get(SOMEONE_CLOSE).state == STATE_UNKNOWN
+    assert hass.states.get(SOMEONE_NEARBY).state == STATE_UNKNOWN
+
+    # A member close by settles it, whatever the others.
+    await step(hass, freezer, ALEX, 500, seconds=3_600)
+    assert hass.states.get(SOMEONE_CLOSE).state == STATE_ON
+    assert hass.states.get(SOMEONE_NEARBY).state == STATE_ON
+
+    # Sam is added, out but not yet placed: unknown again once Alex is far.
+    set_person(hass, SAM, None)
+    sam = person_entry(SAM)
+    sam.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(sam.entry_id)
+    await hass.async_block_till_done()
+    await step(hass, freezer, ALEX, 30_000, seconds=3_600)
+    assert hass.states.get("binary_sensor.sam_close_to_home").state == STATE_UNKNOWN
+    assert hass.states.get(SOMEONE_CLOSE).state == STATE_UNKNOWN
+    assert hass.states.get(SOMEONE_NEARBY).state == STATE_UNKNOWN
+
+    await step(hass, freezer, SAM, 20_000)
+    assert hass.states.get(SOMEONE_CLOSE).state == STATE_OFF
+    assert hass.states.get(SOMEONE_NEARBY).state == STATE_OFF
+
+    # With no member reporting, the group cannot say nobody is close.
+    await hass.config_entries.async_unload(alex.entry_id)
+    await hass.config_entries.async_unload(sam.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get(SOMEONE_CLOSE).state == STATE_UNKNOWN
+    assert hass.states.get(SOMEONE_NEARBY).state == STATE_UNKNOWN
 
 
 async def test_missing_members_reported(hass: HomeAssistant) -> None:

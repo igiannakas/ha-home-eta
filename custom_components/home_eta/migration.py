@@ -9,12 +9,17 @@ Version 1.2 (Home ETA 2.0.0) keeps only what turned out to be useful:
   history) are deleted.
 - The activity, reference travel-time and "zones that end a trip" options fed
   only those, and go with them.
-- Near home is measured per person now: a group's radius and fade move to
-  each of its members.
+- Near home is measured per person now: a group's radius moves to each of
+  its members (its fade did too, until 1.4 removed it).
 
 Version 1.3 (Home ETA 2.1.0) puts heading home and arriving soon into one
 status sensor per person (home, arriving soon, heading home, away); their
 binary sensors are removed from the registry.
+
+Version 1.4 (Home ETA 2.3.0) removes the "near home fades after" setting:
+near home no longer fades after a long stay. The stored value is removed at
+setup, like other leftovers, so a value an older release saved after a
+downgrade goes too.
 
 Each entry is migrated on its own, in whatever order Home Assistant sets them
 up, so a group hands near-home settings to members not yet migrated, and a
@@ -41,16 +46,13 @@ from .const import (
     CONF_ADVANCED,
     CONF_ENTRY_TYPE,
     CONF_MEMBERS,
-    CONF_NEAR_HOME_FADE_AFTER_MIN,
     CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
     CONF_ZONE,
-    DEFAULT_NEAR_HOME_FADE_AFTER_MIN,
     DEFAULT_NEAR_HOME_RADIUS_M,
     DOMAIN,
     ENTRY_TYPE_GROUP,
     ENTRY_TYPE_PERSON,
-    MAX_NEAR_HOME_FADE_AFTER_MIN,
     MAX_NEAR_HOME_RADIUS_M,
     MIN_NEAR_HOME_RADIUS_M,
 )
@@ -58,7 +60,11 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 CONFIG_VERSION = 1
-CONFIG_MINOR_VERSION = 3
+CONFIG_MINOR_VERSION = 4
+
+RETIRED_NEAR_HOME_FADE = "near_home_fade_after_min"
+"""The near-home fade setting of a person, removed in 1.4."""
+RETIRED_PERSON_OPTIONS = (RETIRED_NEAR_HOME_FADE,)
 
 LEGACY_PERSON_OPTIONS = (
     "activity_entity",
@@ -105,8 +111,9 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _migrate_group(hass, entry)
         else:
             _migrate_person(hass, entry)
-    if entry.minor_version < 3:
-        hass.config_entries.async_update_entry(entry, minor_version=3)
+    if entry.minor_version < 4:
+        # Options no longer read are removed at setup: async_remove_retired.
+        hass.config_entries.async_update_entry(entry, minor_version=4)
     _LOGGER.info("Migrated %s to version 1.%s", entry.title, CONFIG_MINOR_VERSION)
     return True
 
@@ -114,14 +121,21 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_remove_retired(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Remove what earlier releases made and this one does not provide.
 
-    Entities no longer provided, and a person's learned trips (location
-    history). Cheap, and a no-op once done.
+    Entities no longer provided, a person's learned trips (location history)
+    and options no longer read. Cheap, and a no-op once done.
     """
     if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_GROUP:
         _remove_entities(hass, entry, LEGACY_GROUP_ENTITIES)
         return
     _remove_entities(hass, entry, LEGACY_PERSON_ENTITIES + REPLACED_BY_STATUS)
     await legacy_store(hass, entry.entry_id).async_remove()
+    if any(key in entry.options for key in RETIRED_PERSON_OPTIONS):
+        options = {
+            key: value
+            for key, value in entry.options.items()
+            if key not in RETIRED_PERSON_OPTIONS
+        }
+        hass.config_entries.async_update_entry(entry, options=options)
 
 
 @callback
@@ -201,12 +215,6 @@ def _near_home_options(options: Mapping[str, Any]) -> dict[str, int]:
             DEFAULT_NEAR_HOME_RADIUS_M,
             MIN_NEAR_HOME_RADIUS_M,
             MAX_NEAR_HOME_RADIUS_M,
-        ),
-        CONF_NEAR_HOME_FADE_AFTER_MIN: _whole(
-            options.get(CONF_NEAR_HOME_FADE_AFTER_MIN),
-            DEFAULT_NEAR_HOME_FADE_AFTER_MIN,
-            0,
-            MAX_NEAR_HOME_FADE_AFTER_MIN,
         ),
     }
 

@@ -335,7 +335,7 @@ async def test_trip_home_saved_for_a_restart(
 
 
 async def test_a_stay_survives_a_restart(hass: HomeAssistant) -> None:
-    """Three hours at a friend's 500 m away: near home stays faded."""
+    """Three hours at a friend's 500 m away: the stay comes back after a restart."""
     now = dt_util.utcnow().timestamp()
     lat, lon = to_latlon(500, 0)
     stay = {
@@ -349,7 +349,7 @@ async def test_a_stay_survives_a_restart(hass: HomeAssistant) -> None:
     set_person(hass, ALEX, 500)
     await setup_entries(hass, person_entry(ALEX))
     near = hass.states.get(NEAR)
-    assert near.state == "0"
+    assert near.state == "100"  # near home does not fade, however long the stay
     assert dt_util.parse_datetime(near.attributes["staying_since"]) == (
         dt_util.utc_from_timestamp(now - 3 * 3_600)
     )

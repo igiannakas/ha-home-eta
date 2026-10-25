@@ -62,18 +62,16 @@ from .const import (
     ADVANCED_PARAMS,
     CONF_ADVANCED,
     CONF_MEMBERS,
-    CONF_NEAR_HOME_FADE_AFTER_MIN,
     CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
     CONF_ZONE,
-    DEFAULT_NEAR_HOME_FADE_AFTER_MIN,
     DEFAULT_NEAR_HOME_RADIUS_M,
     DIAGNOSTICS_COORDINATE_DECIMALS,
     DOMAIN,
     FIX_LOG_SIZE,
     HISTORY_LOOKBACK,
-    NEAR_HOME_FADE_MIN,
     NEAR_HOME_FULL_M,
+    NEAR_HOME_OFF_MARGIN_M,
     RELEARN_KEEP_S,
     SIGNAL_PERSON_UPDATED,
     SPEEDS_REFIT_INTERVAL_S,
@@ -130,14 +128,8 @@ def params_from_options(options: Mapping[str, Any]) -> EstimatorParams:
 def near_home_config_from_options(options: Mapping[str, Any]) -> NearHomeConfig:
     """Build a person's near-home settings from their options."""
     radius = float(options.get(CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M))
-    fade_after = float(
-        options.get(CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN)
-    )
     return NearHomeConfig(
-        radius_m=radius,
-        full_m=NEAR_HOME_FULL_M,
-        fade_after_s=None if fade_after == 0 else fade_after * 60.0,
-        fade_s=NEAR_HOME_FADE_MIN * 60.0,
+        radius_m=radius, full_m=NEAR_HOME_FULL_M, off_margin_m=NEAR_HOME_OFF_MARGIN_M
     )
 
 
@@ -873,8 +865,7 @@ class PersonRuntime:
             "near_home": {
                 "radius_m": near.radius_m,
                 "full_m": near.full_m,
-                "fade_after_s": near.fade_after_s,
-                "fade_s": near.fade_s,
+                "off_margin_m": near.off_margin_m,
             },
             "tracker": self.tracker.diagnostics(),
             "typical_speeds": {
@@ -924,7 +915,7 @@ class NearHome:
     """How near home the nearest member is, and who that is."""
 
     value: float
-    """0 (far, or staying somewhere for long) to 1 (home or close by)."""
+    """0 (far) to 1 (home or close by)."""
     person_id: str
     name: str
     distance_m: float
@@ -942,16 +933,19 @@ class GroupView:
     missing: tuple[str, ...] = ()
     near: NearHome | None = None
     """None when no member's whereabouts are known."""
+    close: tuple[str, ...] = ()
+    """Members home or within the full near-home distance (800 m)."""
+    close_names: tuple[str, ...] = ()
+    nearby: tuple[str, ...] = ()
+    """Members home or within their near-home radius."""
+    nearby_names: tuple[str, ...] = ()
+    unplaced: tuple[str, ...] = ()
+    """Members with data whose distance is not known yet."""
 
     @property
     def first(self) -> HeadingHome | None:
         """Return the member heading home who is expected first."""
         return self.heading_home[0] if self.heading_home else None
-
-    @property
-    def reporting(self) -> int:
-        """Return how many members have data; with none, the group knows nothing."""
-        return sum(len(members) for members in self.by_status.values())
 
     @property
     def persons_home(self) -> tuple[str, ...]:
@@ -986,6 +980,30 @@ class GroupView:
         if self.arriving_soon:
             return True
         if self.missing or not self.by_status:
+            return None
+        return False
+
+    @property
+    def someone_close(self) -> bool | None:
+        """Return True while any member is home or within 800 m.
+
+        None while that cannot be ruled out: a member has no data, or no
+        known distance yet.
+        """
+        return self._anyone(self.close)
+
+    @property
+    def someone_nearby(self) -> bool | None:
+        """Return True while any member is home or within their near-home radius.
+
+        None while that cannot be ruled out, as for :attr:`someone_close`.
+        """
+        return self._anyone(self.nearby)
+
+    def _anyone(self, members: tuple[str, ...]) -> bool | None:
+        if members:
+            return True
+        if self.missing or self.unplaced or not self.by_status:
             return None
         return False
 
@@ -1059,6 +1077,9 @@ class GroupRuntime:
         soon_names: list[str] = []
         missing: list[str] = []
         near: NearHome | None = None
+        close: list[tuple[str, str]] = []
+        nearby: list[tuple[str, str]] = []
+        unplaced: list[str] = []
         for person_id in self.members:
             runtime = persons.get((person_id, self.zone_id))
             if runtime is None or not runtime.view.available:
@@ -1086,6 +1107,12 @@ class GroupRuntime:
                 )
             ):
                 near = NearHome(value, person_id, name, distance)
+            if snapshot.close_to_home is None or snapshot.nearby is None:
+                unplaced.append(person_id)
+            if snapshot.close_to_home:
+                close.append((person_id, name))
+            if snapshot.nearby:
+                nearby.append((person_id, name))
         heading.sort(key=lambda member: (member.arrival, member.person_id))
         self.view = GroupView(
             heading_home=tuple(heading),
@@ -1093,6 +1120,11 @@ class GroupRuntime:
             arriving_soon_names=tuple(soon_names),
             missing=tuple(missing),
             near=near,
+            close=tuple(person for person, _ in close),
+            close_names=tuple(name for _, name in close),
+            nearby=tuple(person for person, _ in nearby),
+            nearby_names=tuple(name for _, name in nearby),
+            unplaced=tuple(unplaced),
         )
         for update in list(self._listeners):
             update()
@@ -1118,6 +1150,9 @@ class GroupRuntime:
                 if status in view.by_status
             },
             "missing": list(view.missing),
+            "close_to_home": list(view.close),
+            "nearby": list(view.nearby),
+            "unplaced": list(view.unplaced),
             "near_home": None
             if view.near is None
             else {

@@ -1,6 +1,6 @@
 [project]
 name = "ha-home-eta"
-version = "2.2.0"
+version = "2.3.0"
 description = "Home Assistant integration saying who is heading home, when they will get there and how near home they are."
 readme = "README.md"
 license = { text = "GPL-3.0-only" }

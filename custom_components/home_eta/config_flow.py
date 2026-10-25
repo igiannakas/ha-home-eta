@@ -23,18 +23,15 @@ from .const import (
     CONF_ADVANCED,
     CONF_ENTRY_TYPE,
     CONF_MEMBERS,
-    CONF_NEAR_HOME_FADE_AFTER_MIN,
     CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
     CONF_ZONE,
     DEFAULT_GROUP_NAME,
-    DEFAULT_NEAR_HOME_FADE_AFTER_MIN,
     DEFAULT_NEAR_HOME_RADIUS_M,
     DEFAULT_ZONE,
     DOMAIN,
     ENTRY_TYPE_GROUP,
     ENTRY_TYPE_PERSON,
-    MAX_NEAR_HOME_FADE_AFTER_MIN,
     MAX_NEAR_HOME_RADIUS_M,
     MIN_NEAR_HOME_RADIUS_M,
 )
@@ -79,17 +76,6 @@ def _near_home_fields() -> dict[probatio.Marker, Any]:
                 mode=selector.NumberSelectorMode.BOX,
             )
         ),
-        probatio.Required(
-            CONF_NEAR_HOME_FADE_AFTER_MIN, default=DEFAULT_NEAR_HOME_FADE_AFTER_MIN
-        ): selector.NumberSelector(
-            selector.NumberSelectorConfig(
-                min=0,
-                max=MAX_NEAR_HOME_FADE_AFTER_MIN,
-                step=5,
-                unit_of_measurement="min",
-                mode=selector.NumberSelectorMode.BOX,
-            )
-        ),
     }
 
 
@@ -117,11 +103,6 @@ def _person_options(user_input: Mapping[str, Any]) -> dict[str, Any]:
     options: dict[str, Any] = {
         CONF_NEAR_HOME_RADIUS_M: int(
             user_input.get(CONF_NEAR_HOME_RADIUS_M, DEFAULT_NEAR_HOME_RADIUS_M)
-        ),
-        CONF_NEAR_HOME_FADE_AFTER_MIN: int(
-            user_input.get(
-                CONF_NEAR_HOME_FADE_AFTER_MIN, DEFAULT_NEAR_HOME_FADE_AFTER_MIN
-            )
         ),
     }
     # Keep only values changed from the defaults, so improved defaults in a

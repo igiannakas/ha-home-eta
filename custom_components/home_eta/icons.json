@@ -1,9 +1,25 @@
 {
   "entity": {
     "binary_sensor": {
+      "close_to_home": {
+        "default": "mdi:home-off-outline",
+        "state": { "on": "mdi:home-circle-outline" }
+      },
+      "nearby": {
+        "default": "mdi:map-marker-off-outline",
+        "state": { "on": "mdi:map-marker-radius-outline" }
+      },
       "someone_arriving_soon": {
         "default": "mdi:home-outline",
         "state": { "on": "mdi:home-account" }
+      },
+      "someone_close_to_home": {
+        "default": "mdi:home-off-outline",
+        "state": { "on": "mdi:home-circle-outline" }
+      },
+      "someone_nearby": {
+        "default": "mdi:map-marker-off-outline",
+        "state": { "on": "mdi:map-marker-radius-outline" }
       }
     },
     "button": {

@@ -21,6 +21,7 @@ from .homeward import (
     HomewardTracker,
     NearHomeConfig,
     near_home,
+    within,
 )
 from .kinematic import Fix, FixOutcome, FixVerdict, KinematicEstimator, Target
 from .params import EstimatorParams
@@ -82,7 +83,14 @@ class TrackerSnapshot:
     other_zones: tuple[str, ...]
     homeward: HomewardSnapshot
     near_home: float | None
-    """0 (far, or staying somewhere for long) to 1 (home or close by)."""
+    """0 (far) to 1 (home or close by); None while the distance is unknown."""
+    close_to_home: bool | None
+    """Home, or within the full near-home distance (800 m); None while unknown.
+
+    Off again only beyond it by the near-home off margin.
+    """
+    nearby: bool | None
+    """Home, or within the near-home radius; None while unknown (margin as above)."""
 
     @property
     def heading_home(self) -> bool:
@@ -128,6 +136,11 @@ class PersonTracker:
         self._at_home = at_target
         self._other_zones: tuple[str, ...] = ()
         self._distance_m: float | None = 0.0 if at_target else None
+        """The published distance: 0 at home, None until a usable position."""
+        self._close: bool | None = True if at_target else None
+        """Close to home at the last distance (kept while unknown, for the margin)."""
+        self._nearby: bool | None = True if at_target else None
+        """Nearby at the last distance (kept while unknown, for the margin)."""
 
     # -- configuration -------------------------------------------------------
 
@@ -183,7 +196,10 @@ class PersonTracker:
         self._kinematic.set_target(target)
         self._homeward.set_target(target, now)
         self._homeward_before_move = None
-        self._distance_m = 0.0 if self._at_home else None
+        if self._at_home:
+            self._distance_m, self._close, self._nearby = 0.0, True, True
+        else:
+            self._distance_m, self._close, self._nearby = None, None, None
 
     def restore_homeward(
         self, data: HomewardRestore, last_heard: float, now: float
@@ -221,6 +237,9 @@ class PersonTracker:
             self._kinematic.reset()
             self._homeward.depart(t)
             self._homeward_before_move = None
+            # Unknown until a usable position: never 0 (home) while out.
+            # Close to home and nearby stay on for the margin as they leave.
+            self._distance_m = None
         self._homeward.set_other_zone(bool(report.other_zones))
 
         position = _position(report)
@@ -243,7 +262,7 @@ class PersonTracker:
                 or outcome.verdict is FixVerdict.MERGED
                 or outcome.rolled_back
             ):
-                self._distance_m = self._kinematic.distance_m
+                self._place(self._kinematic.distance_m)
             if outcome.rolled_back:
                 self._undo_homeward_glitch()
             # An accepted fix always has its distance.
@@ -251,11 +270,13 @@ class PersonTracker:
                 self._feed_homeward(fix, outcome.distance_m, outcome.verdict)
                 return outcome
         elif position is not None and accuracy <= self._p.max_gps_accuracy_m:
-            self._distance_m = haversine_m(
-                position[0],
-                position[1],
-                self._target.latitude,
-                self._target.longitude,
+            self._place(
+                haversine_m(
+                    position[0],
+                    position[1],
+                    self._target.latitude,
+                    self._target.longitude,
+                )
             )
         self._homeward.tick(t, self._fresh_speed(t))
         return outcome
@@ -264,9 +285,22 @@ class PersonTracker:
         """Re-evaluate the time-driven rules."""
         self._homeward.tick(now, self._fresh_speed(now))
 
+    def _place(self, distance_m: float | None) -> None:
+        """Publish a distance from a usable position, with close and nearby.
+
+        None (no fix kept) publishes unknown and keeps the last close and
+        nearby for the margin.
+        """
+        self._distance_m = distance_m
+        if distance_m is not None:
+            config = self._config.near_home
+            margin = config.off_margin_m
+            self._close = within(distance_m, config.full_m, margin, self._close)
+            self._nearby = within(distance_m, config.radius_m, margin, self._nearby)
+
     def _arrive(self, t: float) -> None:
         self._other_zones = ()
-        self._distance_m = 0.0
+        self._distance_m, self._close, self._nearby = 0.0, True, True
         if self._at_home:
             return
         self._at_home = True
@@ -313,14 +347,15 @@ class PersonTracker:
         homeward = self._homeward.snapshot(now)
         distance = self._distance_m
         nearness: float | None
+        close: bool | None
+        nearby: bool | None
         if self._at_home:
-            nearness = 1.0
+            nearness, close, nearby = 1.0, True, True
         elif distance is None:
-            nearness = None
+            nearness, close, nearby = None, None, None
         else:
-            nearness = near_home(
-                distance, homeward.still_since, now, self._config.near_home
-            )
+            nearness = near_home(distance, self._config.near_home)
+            close, nearby = self._close, self._nearby
         return TrackerSnapshot(
             now=now,
             at_home=self._at_home,
@@ -328,6 +363,8 @@ class PersonTracker:
             other_zones=self._other_zones,
             homeward=homeward,
             near_home=nearness,
+            close_to_home=close,
+            nearby=nearby,
         )
 
     def diagnostics(self) -> dict[str, Any]:
@@ -335,6 +372,8 @@ class PersonTracker:
         return {
             "at_home": self._at_home,
             "distance_m": self._distance_m,
+            "close_to_home": self._close,
+            "nearby": self._nearby,
             "other_zones": list(self._other_zones),
             "kinematic": self._kinematic.diagnostics(),
             "homeward": self._homeward.diagnostics(),

@@ -17,6 +17,7 @@ from custom_components.home_eta.core.homeward import (
     SpeedSource,
     near_home,
     trip_speed_mps,
+    within,
 )
 from custom_components.home_eta.core.kinematic import Fix, Target
 from custom_components.home_eta.core.params import EstimatorParams
@@ -129,27 +130,13 @@ def test_closing_faster_never_expects_a_later_arrival(distance: float) -> None:
 
 
 def test_near_home_falls_with_distance() -> None:
-    config = NearHomeConfig(radius_m=3_000, full_m=800, fade_after_s=None)
-    assert near_home(0, None, T0, config) == 1.0
-    assert near_home(800, None, T0, config) == 1.0
-    assert near_home(1_900, None, T0, config) == pytest.approx(0.5)
-    assert near_home(3_000, None, T0, config) == 0.0
-    assert near_home(30_000, None, T0, config) == 0.0
-    assert near_home(math.inf, None, T0, config) == 0.0
-
-
-def test_near_home_fades_after_a_long_stay() -> None:
-    config = NearHomeConfig(radius_m=3_000, fade_after_s=90 * MIN, fade_s=60 * MIN)
-    arrived = T0
-    assert near_home(400, arrived, arrived + 90 * MIN, config) == 1.0
-    assert near_home(400, arrived, arrived + 120 * MIN, config) == pytest.approx(0.5)
-    assert near_home(400, arrived, arrived + 150 * MIN, config) == 0.0
-    assert near_home(400, arrived, arrived + 600 * MIN, config) == 0.0
-    # Not staying anywhere: no fade.
-    assert near_home(400, None, arrived + 600 * MIN, config) == 1.0
-    # Fading off.
-    never = NearHomeConfig(fade_after_s=None)
-    assert near_home(400, arrived, arrived + 600 * MIN, never) == 1.0
+    config = NearHomeConfig(radius_m=3_000, full_m=800)
+    assert near_home(0, config) == 1.0
+    assert near_home(800, config) == 1.0
+    assert near_home(1_900, config) == pytest.approx(0.5)
+    assert near_home(3_000, config) == 0.0
+    assert near_home(30_000, config) == 0.0
+    assert near_home(math.inf, config) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -159,14 +146,33 @@ def test_near_home_fades_after_a_long_stay() -> None:
         {"radius_m": math.nan},
         {"full_m": 3_000},
         {"radius_m": 500},
-        {"fade_s": 0},
-        {"fade_after_s": -1},
-        {"fade_after_s": math.inf},
+        {"full_m": 0},
+        {"full_m": math.inf},
+        {"off_margin_m": -1},
+        {"off_margin_m": math.nan},
+        {"radius_m": 950},
     ],
 )
 def test_near_home_config_rejects_bad_values(kwargs: dict[str, float]) -> None:
     with pytest.raises(ValueError, match="must"):
         NearHomeConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("distance_m", "was", "expected"),
+    [
+        (800.0, None, True),
+        (800.1, None, False),
+        (800.1, False, False),
+        (800.1, True, True),
+        (950.0, True, True),
+        (950.1, True, False),
+    ],
+)
+def test_within_switches_off_only_beyond_the_margin(
+    distance_m: float, was: bool | None, expected: bool
+) -> None:
+    assert within(distance_m, 800.0, 150.0, was) is expected
 
 
 # -- heading home ------------------------------------------------------------
@@ -480,7 +486,7 @@ def test_restore_is_refused_at_home_after_a_change_or_without_a_distance() -> No
 
 
 def test_a_stay_survives_a_restart() -> None:
-    """Three hours at a friend's 500 m away: near home has faded, and stays so."""
+    """Three hours at a friend's 500 m away: the stay comes back after a restart."""
     tracker, phone = out_of_home()
     phone.at(500, after_s=MIN)
     phone.at(505, after_s=20 * MIN)

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er, issue_registry as ir
 import pytest
@@ -22,7 +22,6 @@ from custom_components.home_eta.const import (
     CONF_ADVANCED,
     CONF_ENTRY_TYPE,
     CONF_MEMBERS,
-    CONF_NEAR_HOME_FADE_AFTER_MIN,
     CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
     CONF_ZONE,
@@ -35,6 +34,7 @@ from custom_components.home_eta.migration import (
     LEGACY_GROUP_ENTITIES,
     LEGACY_PERSON_ENTITIES,
     REPLACED_BY_STATUS,
+    RETIRED_NEAR_HOME_FADE,
 )
 from custom_components.home_eta.runtime import DATA_KEY, PersonRuntime
 from tests.helpers import ALEX, SAM, group_entry, person_entry, set_person, step
@@ -116,7 +116,6 @@ async def test_zone_not_ready(hass: HomeAssistant) -> None:
     [
         {CONF_ADVANCED: {"max_gps_accuracy_m": -5}},
         {CONF_NEAR_HOME_RADIUS_M: 500},
-        {CONF_NEAR_HOME_FADE_AFTER_MIN: -10},
     ],
 )
 async def test_invalid_options(hass: HomeAssistant, options: dict[str, Any]) -> None:
@@ -253,6 +252,10 @@ async def test_removing_a_person_takes_them_out_of_groups(
     issues = ir.async_get(hass)
     assert alone.options[CONF_MEMBERS] == []
     assert issues.async_get_issue(DOMAIN, f"group_no_members_{alone.entry_id}")
+    # With nobody in it, the group cannot say nobody is arriving or close.
+    for key in ("someone_arriving_soon", "someone_close_to_home", "someone_nearby"):
+        entity_id = f"binary_sensor.sam_only_{key}"
+        assert hass.states.get(entity_id).state == STATE_UNKNOWN, entity_id
     assert alex.state is ConfigEntryState.LOADED
 
     await hass.config_entries.async_remove(alone.entry_id)
@@ -404,13 +407,9 @@ async def test_migration_from_1_x(
     assert dict(alex.options) == {
         CONF_ADVANCED: {"stale_after_s": 1_200},
         CONF_NEAR_HOME_RADIUS_M: 5_000,
-        CONF_NEAR_HOME_FADE_AFTER_MIN: 0,
     }
-    # Sam was in no group: the defaults.
-    assert dict(sam.options) == {
-        CONF_NEAR_HOME_RADIUS_M: 3_000,
-        CONF_NEAR_HOME_FADE_AFTER_MIN: 90,
-    }
+    # Sam was in no group: the default.
+    assert dict(sam.options) == {CONF_NEAR_HOME_RADIUS_M: 3_000}
     assert dict(group.options) == {CONF_MEMBERS: [ALEX]}
     assert alex.runtime_data.config.near_home.radius_m == 5_000
     assert alex.runtime_data.config.params.stale_after_s == 1_200
@@ -427,8 +426,9 @@ async def test_migration_from_2_0(
 ) -> None:
     """Heading home and arriving soon became states of one status sensor."""
     set_person(hass, ALEX, 5_000)
-    options = {CONF_NEAR_HOME_RADIUS_M: 4_000, CONF_NEAR_HOME_FADE_AFTER_MIN: 60}
-    alex = person_entry(ALEX, options=options)
+    alex = person_entry(
+        ALEX, options={CONF_NEAR_HOME_RADIUS_M: 4_000, RETIRED_NEAR_HOME_FADE: 60}
+    )
     group = group_entry([ALEX])
     for entry in (alex, group):
         entry.add_to_hass(hass)
@@ -443,7 +443,7 @@ async def test_migration_from_2_0(
     for entry in (alex, group):
         assert entry.state is ConfigEntryState.LOADED
         assert entry.minor_version == CONFIG_MINOR_VERSION
-    assert dict(alex.options) == options
+    assert dict(alex.options) == {CONF_NEAR_HOME_RADIUS_M: 4_000}
     registry = er.async_get(hass)
     for entity_id in retired:
         assert registry.async_get(entity_id) is None, entity_id
@@ -470,10 +470,7 @@ async def test_migration_picks_the_same_group_whatever_the_order(
         entries[index].add_to_hass(hass)
     assert await hass.config_entries.async_setup(entries[order[0]].entry_id)
     await hass.async_block_till_done()
-    assert dict(alex.options) == {
-        CONF_NEAR_HOME_RADIUS_M: 5_000,
-        CONF_NEAR_HOME_FADE_AFTER_MIN: 0,
-    }
+    assert dict(alex.options) == {CONF_NEAR_HOME_RADIUS_M: 5_000}
 
 
 async def test_retired_entities_and_trips_are_removed_at_every_setup(
@@ -481,7 +478,10 @@ async def test_retired_entities_and_trips_are_removed_at_every_setup(
 ) -> None:
     """After a downgrade and an upgrade, the older release's leftovers go too."""
     set_person(hass, ALEX, 5_000)
-    alex = person_entry(ALEX)
+    # Saved by 2.2's options flow after a downgrade from 2.3.
+    alex = person_entry(
+        ALEX, options={CONF_NEAR_HOME_RADIUS_M: 4_000, RETIRED_NEAR_HOME_FADE: 90}
+    )
     group = group_entry([ALEX])
     for entry in (alex, group):
         entry.add_to_hass(hass)
@@ -497,6 +497,45 @@ async def test_retired_entities_and_trips_are_removed_at_every_setup(
         assert registry.async_get(entity_id) is None, entity_id
     assert history not in hass_storage
     assert registry.async_get("sensor.alex_status") is not None
+    assert dict(alex.options) == {CONF_NEAR_HOME_RADIUS_M: 4_000}
+    assert alex.state is ConfigEntryState.LOADED
+
+
+async def test_migration_from_2_2(hass: HomeAssistant) -> None:
+    """Near home no longer fades: the setting is dropped, nothing else."""
+    set_person(hass, ALEX, 400)
+    set_person(hass, SAM, 2_000)
+    alex = person_entry(
+        ALEX,
+        options={
+            CONF_NEAR_HOME_RADIUS_M: 4_000,
+            RETIRED_NEAR_HOME_FADE: 60,
+            CONF_ADVANCED: {"stale_after_s": 1_200},
+        },
+    )
+    sam = person_entry(SAM)
+    group = group_entry([ALEX, SAM])
+    for entry in (alex, sam, group):
+        entry.add_to_hass(hass)
+        hass.config_entries.async_update_entry(entry, minor_version=3)
+    assert await hass.config_entries.async_setup(alex.entry_id)
+    await hass.async_block_till_done()
+    for entry in (alex, sam, group):
+        assert entry.state is ConfigEntryState.LOADED
+        assert entry.minor_version == CONFIG_MINOR_VERSION
+    assert dict(alex.options) == {
+        CONF_NEAR_HOME_RADIUS_M: 4_000,
+        CONF_ADVANCED: {"stale_after_s": 1_200},
+    }
+    assert dict(sam.options) == {}
+    assert dict(group.options) == {CONF_MEMBERS: [ALEX, SAM]}
+    assert alex.runtime_data.config.near_home.radius_m == 4_000
+    assert alex.runtime_data.config.params.stale_after_s == 1_200
+    # The new sensors are there from the first start.
+    assert hass.states.get("binary_sensor.alex_close_to_home").state == "on"
+    assert hass.states.get("binary_sensor.sam_close_to_home").state == "off"
+    assert hass.states.get("binary_sensor.sam_nearby").state == "on"
+    assert hass.states.get("binary_sensor.home_eta_someone_close_to_home").state == "on"
 
 
 async def test_migration_falls_back_to_defaults_for_unusable_group_settings(
@@ -509,10 +548,7 @@ async def test_migration_falls_back_to_defaults_for_unusable_group_settings(
         entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(alex.entry_id)
     await hass.async_block_till_done()
-    assert dict(alex.options) == {
-        CONF_NEAR_HOME_RADIUS_M: 3_000,
-        CONF_NEAR_HOME_FADE_AFTER_MIN: 1,
-    }
+    assert dict(alex.options) == {CONF_NEAR_HOME_RADIUS_M: 3_000}
 
 
 async def test_entry_from_a_newer_release_loads(hass: HomeAssistant) -> None:

@@ -209,7 +209,7 @@ class NearHomeSensor(PersonEntity, SensorEntity):
     """How near home the person is, 0-100 %, whichever way they are going.
 
     100 % at home or within 800 m, falling to 0 % at the person's near-home
-    radius. A long stay at one place fades it back to 0 %.
+    radius, however long they stay.
     """
 
     _attr_native_unit_of_measurement = PERCENTAGE
@@ -228,15 +228,13 @@ class NearHomeSensor(PersonEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return the settings in use and since when the person has stayed put."""
+        """Return the radius in use and since when the person has stayed put."""
         config = self._runtime.config.near_home
         snap = self._runtime.view.snapshot
         still_since = None if snap is None else snap.homeward.still_since
-        fade_after = config.fade_after_s
         return {
             "staying_since": _iso(still_since),
             "radius_m": round(config.radius_m),
-            "fade_after_min": None if fade_after is None else round(fade_after / 60.0),
         }
 
 
@@ -422,8 +420,8 @@ class GroupMinutesSensor(GroupEntity, SensorEntity):
 class GroupNearHomeSensor(GroupEntity, SensorEntity):
     """The highest near home of any member, 0-100 %; 100 % while anyone is home.
 
-    Each member's near home uses their own radius and fade, so the member it
-    shows is not always the one nearest.
+    Each member's near home uses their own radius, so the member it shows is
+    not always the one nearest.
     """
 
     _attr_native_unit_of_measurement = PERCENTAGE

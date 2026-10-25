@@ -2,7 +2,7 @@
 
 Each person is its own config entry with its own entities. A separate group
 entry combines people heading to the same zone: the first expected, whether
-anyone is arriving soon, and how near the nearest is.
+anyone is arriving soon, close to home or nearby, and how near the nearest is.
 """
 
 from __future__ import annotations
@@ -40,7 +40,12 @@ _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-PERSON_PLATFORMS = [Platform.BUTTON, Platform.NUMBER, Platform.SENSOR]
+PERSON_PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.NUMBER,
+    Platform.SENSOR,
+]
 GROUP_PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 ISSUES = ("person_missing", "zone_missing", "group_no_members")

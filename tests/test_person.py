@@ -19,11 +19,7 @@ from pytest_homeassistant_custom_component.common import (
     mock_restore_cache_with_extra_data,
 )
 
-from custom_components.home_eta.const import (
-    CONF_NEAR_HOME_FADE_AFTER_MIN,
-    CONF_NEAR_HOME_RADIUS_M,
-    DOMAIN,
-)
+from custom_components.home_eta.const import CONF_NEAR_HOME_RADIUS_M, DOMAIN
 from tests.helpers import ALEX, person_entry, set_person, step
 
 STATUS = "sensor.alex_status"
@@ -34,7 +30,20 @@ NEAR = "sensor.alex_near_home"
 THRESHOLD = "number.alex_arriving_soon_threshold"
 SPEEDS = "sensor.alex_typical_speeds"
 RELEARN = "button.alex_relearn_typical_speeds"
-ALL = (STATUS, EXPECTED, MINUTES, DISTANCE, NEAR, THRESHOLD, SPEEDS, RELEARN)
+CLOSE = "binary_sensor.alex_close_to_home"
+NEARBY = "binary_sensor.alex_nearby"
+ALL = (
+    STATUS,
+    EXPECTED,
+    MINUTES,
+    DISTANCE,
+    NEAR,
+    THRESHOLD,
+    SPEEDS,
+    RELEARN,
+    CLOSE,
+    NEARBY,
+)
 
 pytestmark = pytest.mark.usefixtures("zones")
 
@@ -296,43 +305,97 @@ async def test_near_home_follows_the_person_options(
     set_person(hass, ALEX, 4_000)
     await setup_person(
         hass,
-        options={CONF_NEAR_HOME_RADIUS_M: 8_000, CONF_NEAR_HOME_FADE_AFTER_MIN: 0},
+        options={CONF_NEAR_HOME_RADIUS_M: 8_000},
     )
     near = hass.states.get(NEAR)
     # (8000 - 4000) / (8000 - 800) = 56 %
     assert near.state == "56"
     assert near.attributes["radius_m"] == 8_000
-    assert near.attributes["fade_after_min"] is None
+    assert "fade_after_min" not in near.attributes
     assert near.attributes["staying_since"] is None
+    nearby = hass.states.get(NEARBY)
+    assert nearby.state == "on"
+    assert nearby.attributes["radius_m"] == 8_000
+    assert nearby.attributes["distance_m"] == pytest.approx(4_000, abs=20)
+    assert hass.states.get(CLOSE).state == "off"
 
 
-async def test_near_home_fades_after_a_long_stay(
+async def test_near_home_does_not_fade_however_long_the_stay(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory
 ) -> None:
+    """Six hours at a café 400 m away: near home, close and nearby throughout."""
     set_person(hass, ALEX, None, zones=("zone.home",))
     await setup_person(hass)
     near = hass.states.get(NEAR)
     assert near.attributes["radius_m"] == 3_000
-    assert near.attributes["fade_after_min"] == 90
+    assert "fade_after_min" not in near.attributes
+    assert hass.states.get(CLOSE).state == "on"
+    assert hass.states.get(NEARBY).state == "on"
     await step(hass, freezer, ALEX, 400)
     assert hass.states.get(NEAR).state == "100"
 
     # At the café, the phone reporting every 10 minutes.
-    for minute in range(10, 121, 10):
+    for minute in range(10, 361, 10):
         freezer.tick(timedelta(minutes=10))
         async_fire_time_changed(hass)
         await hass.async_block_till_done()
         set_person(hass, ALEX, 400, accuracy=10.0 + minute % 20 / 10)
         await hass.async_block_till_done()
-        if minute <= 90:
-            assert hass.states.get(NEAR).state == "100", minute
-    # Two hours there: half way through the hour-long fade.
-    near = hass.states.get(NEAR)
-    assert near.state == "50"
-    assert near.attributes["staying_since"] is not None
+        assert hass.states.get(NEAR).state == "100", minute
+        assert hass.states.get(CLOSE).state == "on", minute
+        assert hass.states.get(NEARBY).state == "on", minute
+    assert hass.states.get(NEAR).attributes["staying_since"] is not None
     assert not heading(hass)
-    await tick(hass, freezer, 30)
-    assert hass.states.get(NEAR).state == "0"
+
+
+async def test_close_to_home_and_nearby_follow_the_distance(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    set_person(hass, ALEX, None, zones=("zone.home",))
+    await setup_person(hass)
+    for east, close, nearby in (
+        (500, "on", "on"),
+        (1_500, "off", "on"),
+        (2_900, "off", "on"),
+        (3_200, "off", "off"),
+        (1_000, "off", "on"),
+        (700, "on", "on"),
+    ):
+        await step(hass, freezer, ALEX, east)
+        close_state = hass.states.get(CLOSE)
+        assert close_state.state == close, east
+        assert close_state.attributes["within_m"] == 800
+        assert close_state.attributes["distance_m"] == pytest.approx(east, abs=20)
+        assert hass.states.get(NEARBY).state == nearby, east
+
+
+async def test_close_to_home_and_nearby_are_unknown_until_a_distance_is_known(
+    hass: HomeAssistant,
+) -> None:
+    set_person(hass, ALEX, None)  # out, with no position
+    await setup_person(hass)
+    assert hass.states.get(CLOSE).state == STATE_UNKNOWN
+    assert hass.states.get(NEARBY).state == STATE_UNKNOWN
+    assert hass.states.get(CLOSE).attributes["distance_m"] is None
+
+
+async def test_leaving_home_with_a_poor_fix_is_unknown(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """Regression: the distance stayed 0 after leaving, so close to home stayed on."""
+    set_person(hass, ALEX, None, zones=("zone.home",))
+    await setup_person(hass)
+    assert hass.states.get(CLOSE).state == "on"
+    freezer.tick(timedelta(minutes=5))
+    set_person(hass, ALEX, 20_000, accuracy=500.0)
+    await hass.async_block_till_done()
+    assert hass.states.get(STATUS).state == "away"
+    for entity_id in (DISTANCE, NEAR, CLOSE, NEARBY):
+        assert hass.states.get(entity_id).state == STATE_UNKNOWN, entity_id
+    await step(hass, freezer, ALEX, 20_000, seconds=300)
+    assert hass.states.get(DISTANCE).state == "20000"
+    assert hass.states.get(CLOSE).state == "off"
+    assert hass.states.get(NEARBY).state == "off"
 
 
 async def test_missing_person_raises_issue(hass: HomeAssistant) -> None:
@@ -359,12 +422,14 @@ async def test_person_without_a_location_yet_is_unknown(hass: HomeAssistant) -> 
     """Regression: a person with no data was published as away."""
     hass.states.async_set(ALEX, STATE_UNKNOWN, {})
     await setup_person(hass)
-    for entity_id in (STATUS, DISTANCE, NEAR):
+    for entity_id in (STATUS, DISTANCE, NEAR, CLOSE, NEARBY):
         assert hass.states.get(entity_id).state == STATE_UNKNOWN, entity_id
     set_person(hass, ALEX, 5_000)
     await hass.async_block_till_done()
     assert not heading(hass)
     assert hass.states.get(NEAR).state == "0"
+    assert hass.states.get(CLOSE).state == "off"
+    assert hass.states.get(NEARBY).state == "off"
 
 
 async def test_unknown_person_state_is_ignored(hass: HomeAssistant) -> None:
@@ -400,6 +465,8 @@ async def test_zone_moved_and_removed(hass: HomeAssistant) -> None:
     await hass.async_block_till_done()
     assert hass.states.get(DISTANCE).state == STATE_UNKNOWN
     assert hass.states.get(NEAR).state == STATE_UNKNOWN
+    assert hass.states.get(CLOSE).state == STATE_UNKNOWN
+    assert hass.states.get(NEARBY).state == STATE_UNKNOWN
 
     hass.states.async_remove("zone.home")
     await hass.async_block_till_done()

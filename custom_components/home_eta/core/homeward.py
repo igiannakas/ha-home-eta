@@ -1069,46 +1069,51 @@ class NearHomeConfig:
     """How "near home" is measured for a person."""
 
     radius_m: float = 3_000.0
-    """At this distance or beyond, near home is 0."""
+    """At this distance or beyond, near home is 0; within it, the person is nearby."""
     full_m: float = 800.0
-    """At this distance or closer, near home is 1."""
-    fade_after_s: float | None = 5_400.0
-    """After staying this long at one place, near home fades; None never fades."""
-    fade_s: float = 3_600.0
-    """...to 0 over this long."""
+    """At this distance or closer, near home is 1 and the person is close to home."""
+    off_margin_m: float = 150.0
+    """Close to home and nearby go off only this far beyond their limit.
+
+    About the worst GPS accuracy used, so a phone lying still near a limit
+    does not switch them on and off with every report.
+    """
 
     def __post_init__(self) -> None:
         """Reject values that would break the maths."""
-        for name in ("radius_m", "full_m", "fade_s"):
+        for name in ("radius_m", "full_m"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a positive number, got {value}")
-        if self.full_m >= self.radius_m:
-            raise ValueError("full_m must be below radius_m")
-        fade_after = self.fade_after_s
-        if fade_after is not None and (not math.isfinite(fade_after) or fade_after < 0):
-            raise ValueError(f"fade_after_s must be 0 or more, got {fade_after}")
+        margin = self.off_margin_m
+        if not math.isfinite(margin) or margin < 0:
+            raise ValueError(f"off_margin_m must be 0 or more, got {margin}")
+        # Also keeps close to home within nearby, however the person moves.
+        if self.full_m + margin >= self.radius_m:
+            raise ValueError("full_m + off_margin_m must be below radius_m")
 
 
-def near_home(
-    distance_m: float, still_since: float | None, now: float, config: NearHomeConfig
-) -> float:
+def within(
+    distance_m: float, limit_m: float, margin_m: float, was: bool | None
+) -> bool:
+    """Return whether ``distance_m`` counts as within ``limit_m``.
+
+    On at the limit or closer; once on, off only beyond the limit by more than
+    ``margin_m``.
+    """
+    return distance_m <= (limit_m + margin_m if was else limit_m)
+
+
+def near_home(distance_m: float, config: NearHomeConfig) -> float:
     """Return how near home someone out is, from 0 (far) to 1 (close by).
 
     Falls linearly from 1 at ``full_m`` to 0 at ``radius_m``, in any
-    direction. A long stay at one place (a friend's next door) fades it back
-    to 0, so a nearby afternoon out does not keep the house warm throughout.
+    direction, however long the person stays there.
     """
     if not math.isfinite(distance_m):
         return 0.0
     span = config.radius_m - config.full_m
-    nearness = min(1.0, max(0.0, (config.radius_m - distance_m) / span))
-    fade_after = config.fade_after_s
-    if nearness > 0 and fade_after is not None and still_since is not None:
-        stayed = now - still_since
-        if stayed > fade_after:
-            nearness *= max(0.0, 1.0 - (stayed - fade_after) / config.fade_s)
-    return nearness
+    return min(1.0, max(0.0, (config.radius_m - distance_m) / span))
 
 
 def _ground_m(a: _Fix, b: _Fix) -> float:
