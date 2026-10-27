@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import nullcontext
+from datetime import timedelta
 from types import ModuleType
 from typing import Any
 from unittest.mock import patch
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import EVENT_STATE_CHANGED, STATE_ON, STATE_UNKNOWN
+from homeassistant.const import (
+    EVENT_HOMEASSISTANT_STARTED,
+    EVENT_STATE_CHANGED,
+    STATE_ON,
+    STATE_UNKNOWN,
+)
 from homeassistant.core import (
     CoreState,
     Event,
@@ -353,9 +359,15 @@ async def test_a_stay_survives_a_restart(hass: HomeAssistant) -> None:
     assert dt_util.parse_datetime(near.attributes["staying_since"]) == (
         dt_util.utc_from_timestamp(now - 3 * 3_600)
     )
-    # Saved again for the next restart, as it was.
+    # Saved again for the next restart, as it was, with the report received
+    # while starting (the person's restored state: no fix).
     saved = status_sensor(hass).extra_restore_state_data.as_dict()
-    assert saved == {"last_heard": now - 600, "trip": None, "stay": stay}
+    assert saved == {
+        "last_heard": now - 600,
+        "last_report": hass.states.get(ALEX).last_updated.timestamp(),
+        "trip": None,
+        "stay": stay,
+    }
 
 
 async def test_a_restored_trip_survives_a_second_restart(hass: HomeAssistant) -> None:
@@ -536,6 +548,80 @@ async def test_a_reload_with_no_new_report_keeps_the_expected_arrival(
     assert status["speed_mps"] == before[STATUS].attributes["speed_mps"]
     assert status["speed_source"] == before[STATUS].attributes["speed_source"]
     assert status_sensor(hass).extra_restore_state_data.as_dict() == saved
+
+
+async def test_a_reload_after_a_merged_report_keeps_the_expected_arrival(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """The phone sends the same place again 10 s later, more accurately: merged
+    into the fix before it, so no fix itself, but the report the reload feeds
+    again. It is no news, and nothing is counted twice."""
+    set_person(hass, ALEX, 30_000)
+    alex = person_entry(ALEX)
+    await setup_entries(hass, alex, group_entry([ALEX]))
+    east = 30_000.0
+    for _ in range(6):
+        east -= 12.5 * 240
+        await step(hass, freezer, ALEX, east, seconds=240)
+    east -= 300
+    await step(hass, freezer, ALEX, east, seconds=240)  # one leg in a queue
+    freezer.tick(timedelta(seconds=10))
+    set_person(hass, ALEX, east, accuracy=5.0)
+    await hass.async_block_till_done()
+    saved = status_sensor(hass).extra_restore_state_data.as_dict()
+    assert saved["last_report"] == saved["last_heard"] + 10
+    watched = (EXPECTED, "sensor.home_eta_expected_home")
+    before = {entity_id: hass.states.get(entity_id).state for entity_id in watched}
+    await hass.config_entries.async_reload(alex.entry_id)
+    await hass.async_block_till_done()
+    for entity_id, state in before.items():
+        assert hass.states.get(entity_id).state == state, entity_id
+    after = status_sensor(hass).extra_restore_state_data.as_dict()
+    assert after["trip"]["estimates"] == saved["trip"]["estimates"]
+
+
+async def test_a_restart_keeps_the_saved_estimate_until_the_first_fix(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """The person drove on while Home Assistant was down: their state at
+    startup carries the restore time and is no fix, so the estimate saved is
+    shown; the first fix after startup joins the saved ones."""
+    now = dt_util.utcnow().timestamp()
+    estimates = [
+        {"arrival": now + 1_500, "speed_mps": 12.0, "source": "measured"},
+        {"arrival": now + 1_200, "speed_mps": 12.5, "source": "measured"},
+        {"arrival": now + 1_300, "speed_mps": 12.2, "source": "measured"},
+    ]
+    restore(
+        hass,
+        {
+            "last_heard": now - 300,
+            "last_report": now - 300,
+            "trip": {
+                "since": now - 1_800,
+                "farthest_m": 30_000,
+                "closest_m": 18_000,
+                "arriving_soon": False,
+                "threshold_s": 900,
+                "estimates": estimates,
+            },
+            "stay": None,
+        },
+    )
+    hass.set_state(CoreState.starting)
+    set_person(hass, ALEX, 15_000)  # 3 km on since the last report heard of
+    await setup_entries(hass, person_entry(ALEX))
+    expected = dt_util.parse_datetime(hass.states.get(EXPECTED).state)
+    assert expected is not None
+    assert expected.timestamp() == pytest.approx(now + 1_300, abs=1)  # the middle
+    assert hass.states.get(STATUS).attributes["speed_source"] == "measured"
+    hass.set_state(CoreState.running)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    await step(hass, freezer, ALEX, 14_200, seconds=60)  # the first fix since
+    saved = status_sensor(hass).extra_restore_state_data.as_dict()
+    assert saved["trip"]["estimates"][:-1] == estimates[1:]
+    assert saved["trip"]["estimates"][-1] not in estimates
 
 
 async def test_a_saved_estimate_no_trip_home_could_take_is_dropped(

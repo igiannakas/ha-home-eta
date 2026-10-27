@@ -214,6 +214,54 @@ def test_restore_homeward_then_overdue_at_once() -> None:
     assert not tracker(at_target=True).restore_homeward(data, T0 - 120, T0)
 
 
+def on_the_way_home(
+    more: int = 1, last_leg_mps: float = 13.0
+) -> tuple[PersonTracker, float, float]:
+    """Return a tracker heading home at 13 m/s, a report every 4 minutes, and
+    when (since T0) and how far east the last report was.
+
+    Out to 30 km, a stay, then home: ``more`` reports after the one that
+    started the trip home, the last of them at ``last_leg_mps``.
+    """
+    trk = tracker(at_target=True)
+    t = 0.0
+    trk.update(away(500, t))  # left home
+    for east in (10_000, 20_000, 30_000):
+        t += 20 * MIN
+        trk.update(away(east, t))
+    t += 40 * MIN
+    trk.update(away(30_000, t))  # a stay
+    east = 30_000.0
+    while not trk.homeward.heading:
+        t += 4 * MIN
+        east -= 13.0 * 240
+        trk.update(away(east, t))
+    for leg in range(more):
+        t += 4 * MIN
+        east -= (last_leg_mps if leg == more - 1 else 13.0) * 240
+        trk.update(away(east, t))
+    return trk, t, east
+
+
+def saved_trip_of(trk: PersonTracker) -> HomewardRestore:
+    """Return the trip home ``trk`` saves, read back as from disk."""
+    saved = trk.homeward.restore_data()
+    assert saved is not None
+    assert saved.trip is not None
+    data = HomewardRestore.from_dict(saved.as_dict())
+    assert data == saved
+    return saved
+
+
+def reloaded(data: HomewardRestore, state: PersonReport, now: float) -> PersonTracker:
+    """Return a tracker reloaded as the runtime does it: the person's state fed
+    as its first fix, then the trip home saved restored."""
+    trk = tracker()
+    trk.update(state)
+    assert trk.restore_homeward(data, data.last_heard, now)
+    return trk
+
+
 @pytest.mark.parametrize(
     ("more", "last_leg_mps"),
     [(0, 13.0), (1, 13.0), (2, 13.0), (3, 1.0)],
@@ -222,41 +270,139 @@ def test_restore_homeward_then_overdue_at_once() -> None:
 def test_a_reload_with_no_new_report_keeps_the_expected_arrival(
     more: int, last_leg_mps: float
 ) -> None:
-    """As the runtime reloads: a new tracker, the person's unchanged state fed
-    as its first fix, then the trip home saved restored. With one to three
-    estimates saved, and with the last held back by a crawled leg."""
-    before = tracker(at_target=True)
-    t = 0.0
-    before.update(away(500, t))  # left home
-    for east in (10_000, 20_000, 30_000):
-        t += 20 * MIN
-        before.update(away(east, t))
-    t += 40 * MIN
-    before.update(away(30_000, t))  # a stay
-    east = 30_000.0
-    while not before.homeward.heading:
-        t += 4 * MIN
-        east -= 13.0 * 240
-        before.update(away(east, t))
-    for leg in range(more):
-        t += 4 * MIN
-        east -= (last_leg_mps if leg == more - 1 else 13.0) * 240
-        before.update(away(east, t))
+    """With one to three estimates saved, and the last held back by a crawled leg."""
+    before, t, east = on_the_way_home(more, last_leg_mps)
     published = before.snapshot(T0 + t)
-    saved = before.homeward.restore_data()
-    assert saved is not None
+    saved = saved_trip_of(before)
     assert saved.trip is not None
     assert len(saved.trip.estimates) == min(more + 1, ESTIMATE_WINDOW)
-
-    after = tracker()
-    after.update(away(east, t))  # the same report, at the same time
-    data = HomewardRestore.from_dict(saved.as_dict())
-    assert data is not None
-    assert after.restore_homeward(data, data.last_heard, T0 + t)
+    after = reloaded(saved, away(east, t), T0 + t)  # the same report
     snap = after.snapshot(T0 + t)
     assert snap.expected_home == published.expected_home
     assert snap.homeward.speed_source is published.homeward.speed_source
     assert after.homeward.restore_data() == saved
+
+
+@pytest.mark.parametrize(
+    ("moved_m", "accuracy", "verdict"),
+    [(0.0, 5.0, FixVerdict.MERGED), (-15_000.0, 10.0, FixVerdict.REJECTED_JUMP)],
+    ids=["merged", "jump"],
+)
+def test_a_reload_after_a_report_that_was_no_fix_keeps_the_expected_arrival(
+    moved_m: float, accuracy: float, verdict: FixVerdict
+) -> None:
+    """The last report 10 s after the last fix: the same place more accurately
+    (merged into it), or 15 km nearer home (a jump). Neither was a fix, so
+    neither moved when the person was last heard from; at the reload it is the
+    person's state, the first fix of the new run, but no news."""
+    before, t, east = on_the_way_home(more=2, last_leg_mps=1.0)
+    last = away(east + moved_m, t + 10, accuracy=accuracy)
+    outcome = before.update(last)
+    assert outcome is not None
+    assert outcome.verdict is verdict
+    published = before.snapshot(T0 + t + 10)
+    saved = saved_trip_of(before)
+    assert saved.last_heard == T0 + t
+    assert saved.last_report == T0 + t + 10
+    after = reloaded(saved, last, T0 + t + 10)
+    snap = after.snapshot(T0 + t + 10)
+    assert snap.heading_home
+    assert snap.expected_home == published.expected_home
+    data = after.homeward.restore_data()
+    assert data is not None
+    assert data.trip is not None
+    assert saved.trip is not None
+    assert data.trip.estimates == saved.trip.estimates
+    assert data.last_report == saved.last_report
+
+
+@pytest.mark.parametrize("ticked", [True, False], ids=["ticked", "not-ticked"])
+def test_a_reload_after_the_clock_stepped_back_keeps_the_expected_arrival(
+    ticked: bool,
+) -> None:
+    """The clock was two hours fast. The stored times move back with it at the
+    next tick, before the save or after the reload; the person's state, fed
+    again at the reload, keeps the time it was reported at. Either way the
+    expected arrival is what the old run would show, and nothing is counted
+    twice."""
+    before, t, east = on_the_way_home(more=2, last_leg_mps=1.0)
+    now = T0 + t - 2 * 3_600
+    if ticked:
+        before.tick(now)
+    saved = saved_trip_of(before)
+    assert saved.last_report == T0 + t
+    assert (saved.last_heard <= now) is ticked
+    if not ticked:
+        before.tick(now)
+    published = before.snapshot(now)
+    assert published.expected_home is not None
+    assert published.expected_home - now > 20 * MIN
+    after = reloaded(saved, away(east, t), now)
+    assert after.snapshot(now).expected_home == pytest.approx(
+        published.expected_home, abs=1e-3
+    )
+    data = after.homeward.restore_data()
+    assert data is not None
+    assert data.trip is not None
+    assert saved.trip is not None
+    assert len(data.trip.estimates) == len(saved.trip.estimates)
+
+
+def test_a_reload_with_a_newer_report_counts_it() -> None:
+    """One that came in during the reload: news, so its estimate joins."""
+    before, t, east = on_the_way_home(more=2)
+    saved = saved_trip_of(before)
+    assert saved.trip is not None
+    after = reloaded(saved, away(east - 13.0 * 60, t + MIN), T0 + t + MIN)
+    data = after.homeward.restore_data()
+    assert data is not None
+    assert data.trip is not None
+    assert data.trip.estimates[:-1] == saved.trip.estimates[1:]
+    assert data.trip.estimates[-1] not in saved.trip.estimates
+
+
+def test_a_reload_of_data_saved_without_the_last_report() -> None:
+    """Saved by 2.4.0 before this was kept: the last fix stands in for it."""
+    before, t, east = on_the_way_home(more=2, last_leg_mps=1.0)
+    published = before.snapshot(T0 + t)
+    saved = saved_trip_of(before).as_dict()
+    del saved["last_report"]
+    old = HomewardRestore.from_dict(saved)
+    assert old is not None
+    assert old.last_report is None
+    after = reloaded(old, away(east, t), T0 + t)
+    assert after.snapshot(T0 + t).expected_home == published.expected_home
+    newer = reloaded(old, away(east - 13.0 * 60, t + MIN), T0 + t + MIN)
+    data = newer.homeward.restore_data()
+    assert data is not None
+    assert data.trip is not None
+    assert old.trip is not None
+    assert data.trip.estimates[-1] not in old.trip.estimates
+
+
+def test_a_restart_after_news_while_down_keeps_the_estimate_until_a_fix() -> None:
+    """Home Assistant was down while the person drove on: at startup their
+    state carries the restore time and is no fix, so the estimate saved is
+    published; the first fix after startup joins the saved ones."""
+    before, t, east = on_the_way_home(more=2)
+    published = before.snapshot(T0 + t)
+    saved = saved_trip_of(before)
+    assert saved.trip is not None
+    start = t + 5 * MIN
+    east -= 13.0 * 5 * MIN
+    after = tracker()
+    after.update(away(east, start), use_for_kinematics=False)
+    assert after.restore_homeward(saved, saved.last_heard, T0 + start)
+    snap = after.snapshot(T0 + start)
+    assert snap.expected_home == published.expected_home
+    assert snap.homeward.speed_source is published.homeward.speed_source
+    after.update(away(east - 13.0 * MIN, start + MIN))  # the first fix since
+    data = after.homeward.restore_data()
+    assert data is not None
+    assert data.trip is not None
+    assert data.last_report == T0 + start + MIN
+    assert data.trip.estimates[:-1] == saved.trip.estimates[1:]
+    assert data.trip.estimates[-1] not in saved.trip.estimates
 
 
 def test_near_home_follows_distance_however_long_the_stay() -> None:

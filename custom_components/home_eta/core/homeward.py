@@ -20,10 +20,10 @@ questions:
   typical speeds are learned from the person's own trips home
   (``core/calibration.py``): each completed trip is handed over for that.
   What is published is the middle of the last three estimates worked out at
-  fixes (``ESTIMATE_WINDOW``) that have not yet passed, so one estimate that
-  disagrees with the two before it waits for the next fix to confirm it; a
-  zone crossing whose ring-to-ring speed is in use, a speed measured over
-  kilometres, is believed at once.
+  fixes (``ESTIMATE_WINDOW``), so one estimate that disagrees with the two
+  before it waits for the next fix to confirm it; a zone crossing whose
+  ring-to-ring speed is in use, a speed measured over kilometres, is believed
+  at once. Between fixes it stands until it passes, then the one due later.
 - **Is the person arriving soon?** On a trip home, once the newest estimate
   (that of the last fix alone, not the one published) is within the person's
   threshold or they are within 800 m, unless they are inside another zone (a
@@ -140,8 +140,8 @@ class HomewardSnapshot:
     arrival: float | None
     """Expected arrival (never in the past), only while heading home.
 
-    The middle of the last ``ESTIMATE_WINDOW`` estimates worked out at fixes,
-    leaving out those that have passed.
+    The middle of the last ``ESTIMATE_WINDOW`` estimates worked out at fixes;
+    once it has passed, the one due later (see ``HomewardTracker._estimate``).
     """
     speed_mps: float | None
     """The speed behind ``arrival`` (that of the estimate published)."""
@@ -189,12 +189,21 @@ class HomewardRestore:
     """When the person was last heard from."""
     trip: HomewardTrip | None = None
     stay: HomewardStay | None = None
+    last_report: float | None = None
+    """The time of the last report received, whatever became of it.
+
+    A report merged into the fix before it, rejected as a jump or received
+    while Home Assistant was starting is no fix, so ``last_heard`` does not
+    show it; at a reload the person's state is that report again. None in
+    data saved before 2.4.0.
+    """
 
     def as_dict(self) -> dict[str, object]:
         """Return the data as JSON-serialisable values."""
         trip, stay = self.trip, self.stay
         return {
             "last_heard": self.last_heard,
+            "last_report": self.last_report,
             "trip": None
             if trip is None
             else {
@@ -278,7 +287,7 @@ class HomewardRestore:
                 stay = HomewardStay(since, latitude, longitude, distance)
         if trip is None and stay is None:
             return None
-        return cls(last_heard, trip, stay)
+        return cls(last_heard, trip, stay, _number(value.get("last_report")))
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +434,12 @@ class HomewardTracker:
         when the person gets home."""
         self._estimates: tuple[HomewardEstimate, ...] = ()
         """The latest estimates of the trip home in progress, oldest first."""
+        self._last_report: float | None = None
+        """The time of the last report received (``note_report``), as it came.
+
+        Not moved when the clock steps back, nor undone with a glitch: it
+        tells a report received from one not received yet.
+        """
         self._completed: list[LearnedTrip] = []
 
     # -- state -----------------------------------------------------------
@@ -492,7 +507,7 @@ class HomewardTracker:
             )
         if trip is None and stay is None:
             return None
-        return HomewardRestore(last_heard, trip, stay)
+        return HomewardRestore(last_heard, trip, stay, self._last_report)
 
     def save(self) -> HomewardState:
         """Return the state, to put back with ``load`` if a fix was a glitch."""
@@ -562,6 +577,7 @@ class HomewardTracker:
             "zones_inside": len(self._inside),
             "zones": len(self._rings),
             "trip_samples": len(self._samples),
+            "last_report": self._last_report,
             "estimates": [
                 {
                     "arrival": estimate.arrival,
@@ -630,6 +646,17 @@ class HomewardTracker:
         """
         self._curves = curves
 
+    def note_report(self, t: float) -> None:
+        """Note a report of the person received at ``t``, whatever becomes of it.
+
+        Every report while out, before it is judged: one merged into the last
+        fix, rejected as a jump, without a position, or received while Home
+        Assistant is starting, as well as each fix. Saved for a reload, which
+        feeds the person's state again: a report not newer than this one is
+        news already had.
+        """
+        self._last_report = t
+
     def discard_samples(self) -> None:
         """Forget what was kept of the trip home in progress, to learn from.
 
@@ -639,7 +666,12 @@ class HomewardTracker:
         self._samples = ()
 
     def restore(
-        self, data: HomewardRestore, last_heard: float, distance_m: float | None
+        self,
+        data: HomewardRestore,
+        last_heard: float,
+        distance_m: float | None,
+        *,
+        now: float,
     ) -> bool:
         """Resume a stay and a trip home saved before a restart or reload.
 
@@ -649,11 +681,33 @@ class HomewardTracker:
         stay is kept if that fix is still there, and the trip's farthest and
         closest points are merged with it. Only while nothing has happened to
         the trip home in this run. From then on both end like any other: the
-        next fixes, a stay or the overdue rule decide.
+        next fixes, a stay or the overdue rule decide. ``now`` is when this
+        happens: a fix of this run reported before the clock stepped back is
+        moved to it first, as the next tick would.
         """
         if self._home:
             return False
         last = self._last
+        # Saved before 2.4.0: only the last fix is known.
+        received = data.last_heard if data.last_report is None else data.last_report
+        # After a reload the person's state is a fix of this run. One newer
+        # than the last report received is news the saved estimates do not
+        # have; that report fed again (a reload with nothing new) is not, even
+        # when it was no fix then (merged, rejected as a jump). Judged on the
+        # times as reported, before any is moved for the clock.
+        news = last is not None and last.t > received
+        p = self._p
+        if (
+            last is not None
+            and last.t - now > p.clock_step_back_s
+            and data.last_heard - now <= p.clock_step_back_s
+        ):
+            # The clock stepped back since the person's state was reported,
+            # and the saved times were already moved back with it (a tick
+            # came between). Move this run's likewise first, as the next tick
+            # would, or that tick would move the saved times back again.
+            self._shift_times(now - last.t)
+            last = self._last
         if last is None:
             if distance_m is None or not math.isfinite(distance_m) or distance_m < 0:
                 return False
@@ -683,11 +737,7 @@ class HomewardTracker:
             self._reason = HomewardReason.RESTORED
             self._since = trip.since
             self._estimates = self._saved_estimates(trip, data.last_heard)
-            if last is not None and last.t > data.last_heard:
-                # After a reload the person's state is a fix of this run. One
-                # newer than the last one heard of is a report the saved
-                # estimates do not include, so its estimate joins them; the
-                # same report fed again (a reload with nothing new) is not.
+            if news and last is not None:
                 self._note_estimate(last.t, crossing=False)
             self._soon = trip.arriving_soon
             saved = trip.threshold_s
@@ -702,6 +752,9 @@ class HomewardTracker:
         if restored and last is None:
             self._restored_heard = last_heard
             self._restored_distance_m = distance_m
+        if restored and self._last_report is None:
+            # No report in this run yet: the last one received is still that.
+            self._last_report = data.last_report
         return restored
 
     # -- input -----------------------------------------------------------
@@ -1148,24 +1201,30 @@ class HomewardTracker:
     def _estimate(self, now: float) -> HomewardEstimate | None:
         """Return the estimate to publish at ``now`` (its arrival may be past).
 
-        The middle by arrival of the last ``ESTIMATE_WINDOW`` estimates that
-        have not passed by ``now``; the latest of them until there are that
-        many. An estimate whose time has passed with the person still out is
-        known to be wrong, between fixes as at one, so the one published
-        moves on to the next rather than sit at "now". Once all have passed,
-        the newest (the snapshot shows "now", as before 2.4.0). A trip
-        restored without any (saved before 2.4.0) has only its own until the
-        next fix.
+        The one shown since the last fix (``_shown``) until its time passes
+        with the person still out, when it is known to be wrong: then the one
+        estimate due later than it, if any. One due earlier passing changes
+        nothing. The one shown is the middle of three, or the newer of two,
+        so when it passes at most one is due later: it moves on at most once
+        between fixes. Once all have passed, the newest (the snapshot shows
+        "now", as before 2.4.0). A trip restored without any (saved before
+        2.4.0) has only its own until the next fix.
+
+        Moving on keeps a passed estimate from standing at "now" while a later
+        one is known, at a cost: closing faster makes the one shown pass
+        sooner, so between fixes a faster trip can show the later arrival for
+        a while. At a fix, closing faster never means a later arrival.
         """
         estimates = self._estimates
         if not estimates:
             return self._current_estimate()
-        live = [estimate for estimate in estimates if estimate.arrival >= now]
-        if not live:
-            return estimates[-1]
-        if len(live) < ESTIMATE_WINDOW:
-            return live[-1]
-        return sorted(live, key=lambda estimate: estimate.arrival)[ESTIMATE_WINDOW // 2]
+        shown = _shown(estimates)
+        if shown.arrival >= now:
+            return shown
+        later = [estimate for estimate in estimates if estimate.arrival >= now]
+        if later:
+            return min(later, key=lambda estimate: estimate.arrival)
+        return estimates[-1]
 
     def _newest_arrival(self) -> float | None:
         """Return the arrival arriving soon and the overdue rule go by.
@@ -1283,6 +1342,20 @@ def near_home(distance_m: float, config: NearHomeConfig) -> float:
         return 0.0
     span = config.radius_m - config.full_m
     return min(1.0, max(0.0, (config.radius_m - distance_m) / span))
+
+
+def _shown(estimates: tuple[HomewardEstimate, ...]) -> HomewardEstimate:
+    """Return the estimate shown at the fix that left ``estimates``.
+
+    The middle by arrival of ``ESTIMATE_WINDOW``; the latest until there are
+    that many. A fix keeps only estimates that have not passed, so none had
+    then.
+    """
+    if len(estimates) < ESTIMATE_WINDOW:
+        return estimates[-1]
+    return sorted(estimates, key=lambda estimate: estimate.arrival)[
+        ESTIMATE_WINDOW // 2
+    ]
 
 
 def _ground_m(a: _Fix, b: _Fix) -> float:

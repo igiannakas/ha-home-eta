@@ -209,7 +209,7 @@ class PersonTracker:
         They end like any other: the first fixes, a stay or the overdue rule,
         which is applied at once.
         """
-        if not self._homeward.restore(data, last_heard, self._distance_m):
+        if not self._homeward.restore(data, last_heard, self._distance_m, now=now):
             return False
         self._homeward.tick(now, self._fresh_speed(now))
         return True
@@ -240,6 +240,7 @@ class PersonTracker:
             # Unknown until a usable position: never 0 (home) while out.
             # Close to home and nearby stay on for the margin as they leave.
             self._distance_m = None
+        self._homeward.note_report(t)
         self._homeward.set_other_zone(bool(report.other_zones))
 
         position = _position(report)
