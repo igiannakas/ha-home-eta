@@ -19,10 +19,17 @@ questions:
   and close means on foot, and the measured speed is used as it is. The
   typical speeds are learned from the person's own trips home
   (``core/calibration.py``): each completed trip is handed over for that.
+  What is published is the middle of the last three estimates worked out at
+  fixes (``ESTIMATE_WINDOW``), so one estimate that disagrees with the two
+  before it waits for the next fix to confirm it; a zone crossing, whose
+  speed is measured over kilometres, is believed at once.
 - **Is the person arriving soon?** On a trip home, once the expected arrival
   is within the person's threshold or they are within 800 m, unless they are
   inside another zone (a shop near home). It then stays on until the trip
   home ends, so an estimate that wobbles round the threshold does not flap.
+  It goes by the later of the estimate published and the newest, as does the
+  rule that ends a trip home gone quiet: neither acts on an estimate the next
+  fix may still drop, nor on one the newest already shows out of date.
 
 A "place" is where the person stayed: a fix within ``place_radius_m`` (or
 ``place_accuracy_factor`` times its accuracy) of where they were at least
@@ -61,6 +68,25 @@ SAMPLE_INTERVAL_S = 60.0
 MAX_TRIP_SAMPLES = 360
 """...and at most this many (the latest), six hours' worth."""
 
+ESTIMATE_WINDOW = 3
+"""The expected arrival published is the middle one of the last this many.
+
+Each fix gives an estimate: the distance over the speed expected for the rest
+of the trip. In stop-start traffic one of them is often far off and the next
+puts it back: one leg crawled or sped through (the closing speed is measured
+leg by leg, and a fix every five minutes is about the filter's own time
+constant), a gap in reports that leaves no measured speed (the typical one is
+used until the next fix), or a switch between those and the speed between
+zones. The middle of three drops such a lone estimate, and follows a change
+that the next fix confirms one fix late (a steady drift too: on 27 October
+2026 that put the estimate up to 1.4 minutes further off in the last ten).
+Three is the fewest that can tell which of two disagreeing estimates is the
+odd one; five left more changes (20 rather than 16) and lags two fixes.
+Replayed on the household's trips home of 16-27 October 2026 (ten, two
+people): changes of more than ten minutes between fixes 30 to 16, mean error
+18.1 to 17.3 minutes, heading home and arriving soon at the same moments.
+"""
+
 
 class HomewardReason(StrEnum):
     """Why heading home started or ended."""
@@ -88,6 +114,16 @@ class SpeedSource(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class HomewardEstimate:
+    """An expected arrival worked out at a fix, with the speed behind it."""
+
+    arrival: float
+    """When the person was expected home then (may since have passed)."""
+    speed_mps: float
+    source: SpeedSource
+
+
+@dataclass(frozen=True, slots=True)
 class HomewardSnapshot:
     """What is published about the trip home at an instant."""
 
@@ -96,9 +132,12 @@ class HomewardSnapshot:
     since: float | None
     """When heading home started or last ended."""
     arrival: float | None
-    """Expected arrival (never in the past), only while heading home."""
+    """Expected arrival (never in the past), only while heading home.
+
+    The middle of the last ``ESTIMATE_WINDOW`` estimates worked out at fixes.
+    """
     speed_mps: float | None
-    """The speed behind ``arrival``."""
+    """The speed behind ``arrival`` (that of the estimate published)."""
     speed_source: SpeedSource | None
     farthest_m: float | None
     """Farthest distance since the person last stayed somewhere."""
@@ -121,6 +160,8 @@ class HomewardTrip:
     arriving_soon: bool = False
     threshold_s: float | None = None
     """The threshold arriving soon was judged with (None in data from 2.1.0)."""
+    estimates: tuple[HomewardEstimate, ...] = ()
+    """The latest estimates worked out at fixes, oldest first (none before 2.4.0)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +196,14 @@ class HomewardRestore:
                 "closest_m": trip.closest_m,
                 "arriving_soon": trip.arriving_soon,
                 "threshold_s": trip.threshold_s,
+                "estimates": [
+                    {
+                        "arrival": estimate.arrival,
+                        "speed_mps": estimate.speed_mps,
+                        "source": estimate.source.value,
+                    }
+                    for estimate in trip.estimates
+                ],
             },
             "stay": None
             if stay is None
@@ -201,6 +250,8 @@ class HomewardRestore:
                     soon,
                     # A threshold that is no use is dropped, not the trip.
                     threshold if threshold is not None and threshold > 0 else None,
+                    # So are estimates that are no use.
+                    _estimates_from(saved_trip.get("estimates")),
                 )
         stay: HomewardStay | None = None
         saved_stay = value.get("stay")
@@ -266,6 +317,7 @@ class HomewardState:
     threshold_s: float
     """The threshold ``soon`` was judged with."""
     samples: tuple[_Sample, ...]
+    estimates: tuple[HomewardEstimate, ...]
 
 
 def trip_speed_mps(
@@ -364,6 +416,8 @@ class HomewardTracker:
         self._samples: tuple[_Sample, ...] = ()
         """Fixes of the trip home in progress, to learn typical speeds from
         when the person gets home."""
+        self._estimates: tuple[HomewardEstimate, ...] = ()
+        """The latest estimates of the trip home in progress, oldest first."""
         self._completed: list[LearnedTrip] = []
 
     # -- state -----------------------------------------------------------
@@ -421,6 +475,7 @@ class HomewardTracker:
                 self._closest_m,
                 self._soon,
                 self._threshold_s,
+                self._estimates,
             )
         stay: HomewardStay | None = None
         anchor, since = self._anchor, self._place_since
@@ -454,6 +509,7 @@ class HomewardTracker:
             soon=self._soon,
             threshold_s=self._threshold_s,
             samples=self._samples,
+            estimates=self._estimates,
         )
 
     def load(self, saved: HomewardState) -> None:
@@ -475,6 +531,7 @@ class HomewardTracker:
         self._since = saved.since
         self._closest_m = saved.closest_m
         self._samples = saved.samples
+        self._estimates = saved.estimates
         # The threshold is not a fix's to undo; an arriving soon judged with
         # an earlier one is judged afresh.
         self._soon = saved.soon and saved.threshold_s == self._threshold_s
@@ -498,6 +555,14 @@ class HomewardTracker:
             "zones_inside": len(self._inside),
             "zones": len(self._rings),
             "trip_samples": len(self._samples),
+            "estimates": [
+                {
+                    "arrival": estimate.arrival,
+                    "speed_mps": estimate.speed_mps,
+                    "source": estimate.source.value,
+                }
+                for estimate in self._estimates
+            ],
         }
 
     # -- configuration ---------------------------------------------------
@@ -550,9 +615,9 @@ class HomewardTracker:
     def set_speed_curves(self, curves: SpeedCurves) -> None:
         """Use these typical speeds from the next fix on.
 
-        The speed worked out at the last fix stands until then. Only a trip
-        restored after a restart, with no fix yet, uses the new typical
-        speed at once (it has no speed of its own until a fix).
+        The estimates worked out at fixes stand until the next one. Only a
+        trip restored without any (saved before 2.4.0), with no fix yet,
+        uses the new typical speed at once (it has no speed of its own).
         """
         self._curves = curves
 
@@ -608,6 +673,11 @@ class HomewardTracker:
             self._heading = True
             self._reason = HomewardReason.RESTORED
             self._since = trip.since
+            self._estimates = trip.estimates[-ESTIMATE_WINDOW:]
+            if last is not None:
+                # After a reload the person's state is a fix of this run: its
+                # estimate joins the saved ones.
+                self._note_estimate(last.t, crossing=False)
             self._soon = trip.arriving_soon
             saved = trip.threshold_s
             if not self._threshold_set and saved is not None:
@@ -737,7 +807,9 @@ class HomewardTracker:
                 self._inward = (*self._inward[-1:], (t, distance_m))
         self._last = fix
         self._trip_speed = self._speed_at(t, distance_m, speed_mps)
-        self._evaluate(t, speed_mps, entered=entered, left_trigger=left_trigger)
+        self._evaluate(
+            t, speed_mps, entered=entered, left_trigger=left_trigger, new_fix=True
+        )
         ring = self._ring_speed(t)
         self._keep_sample(
             _Sample(t, distance_m, speed_mps if ring is None else ring),
@@ -763,11 +835,20 @@ class HomewardTracker:
         *,
         entered: frozenset[Target] = frozenset(),
         left_trigger: bool = False,
+        new_fix: bool = False,
     ) -> None:
         distance = self._distance()
         if distance is None:
             return
         self._confirm_quiet_stay(now)
+        if new_fix and self._heading:
+            # A crossing whose ring-to-ring speed is in use: a speed measured
+            # over kilometres, believed at once.
+            crossing = bool(entered) and (
+                self._trip_speed is not None
+                and self._trip_speed[1] is SpeedSource.ZONE_CROSSINGS
+            )
+            self._note_estimate(now, crossing=crossing)
         self._judge_heading(now, distance, speed_mps, entered, left_trigger)
         self._judge_soon(now, distance)
 
@@ -786,7 +867,7 @@ class HomewardTracker:
                 distance if self._closest_m is None else min(self._closest_m, distance)
             )
             self._closest_m = closest
-            arrival = self._raw_arrival()
+            arrival = self._judged_arrival()
             last_time = self._last_time()
             grace = (
                 p.homeward_overdue_s
@@ -834,7 +915,7 @@ class HomewardTracker:
             return
         if self._soon:
             return
-        arrival = self._raw_arrival()
+        arrival = self._judged_arrival()
         self._soon = distance <= self._p.arriving_soon_distance_m or (
             arrival is not None and arrival - now <= self._threshold_s
         )
@@ -847,6 +928,8 @@ class HomewardTracker:
         self._trigger = frozenset()
         self._soon = False
         self._samples = ()
+        current = self._current_estimate()
+        self._estimates = () if current is None else (current,)
 
     def _end(self, reason: HomewardReason, now: float) -> None:
         self._heading = False
@@ -857,6 +940,7 @@ class HomewardTracker:
         self._soon = False
         # Arriving hands the trip over first; any other end is not a trip home.
         self._samples = ()
+        self._estimates = ()
 
     def _keep_sample(self, sample: _Sample, *, crossing: bool) -> None:
         """Keep a fix of the trip home, to learn typical speeds from on arrival.
@@ -914,6 +998,10 @@ class HomewardTracker:
         self._samples = tuple(
             replace(sample, t=sample.t + delta) for sample in self._samples
         )
+        self._estimates = tuple(
+            replace(estimate, arrival=estimate.arrival + delta)
+            for estimate in self._estimates
+        )
 
     def _clear_trip(self) -> None:
         self._last = None
@@ -929,6 +1017,7 @@ class HomewardTracker:
         self._inward = ()
         self._trip_speed = None
         self._samples = ()
+        self._estimates = ()
         self._restored_heard = self._restored_distance_m = None
 
     def _distance(self) -> float | None:
@@ -1020,15 +1109,65 @@ class HomewardTracker:
             return None
         return self._curves.typical_mps(distance, driving=False), SpeedSource.TYPICAL
 
-    def _raw_arrival(self) -> float | None:
-        """Return the expected arrival, which may be in the past."""
+    def _current_estimate(self) -> HomewardEstimate | None:
+        """Return the estimate from the last fix (or restored distance) alone."""
         distance = self._distance()
         last_time = self._last_time()
         speed = self._expected_speed()
         if distance is None or last_time is None or speed is None:
             return None
         remaining = max(distance - self._target.radius_m, 0.0)
-        return last_time + min(remaining / speed[0], self._p.max_eta_s)
+        return HomewardEstimate(
+            last_time + min(remaining / speed[0], self._p.max_eta_s), *speed
+        )
+
+    def _note_estimate(self, now: float, *, crossing: bool) -> None:
+        """Keep the estimate worked out at the fix just received (at ``now``).
+
+        An estimate whose arrival has passed without the person arriving is
+        known to be wrong, so it no longer counts. A zone crossing whose
+        ring-to-ring speed is in use starts afresh from its own estimate.
+        """
+        current = self._current_estimate()
+        if current is None:
+            return
+        kept = () if crossing else tuple(e for e in self._estimates if e.arrival >= now)
+        self._estimates = (*kept, current)[-ESTIMATE_WINDOW:]
+
+    def _estimate(self) -> HomewardEstimate | None:
+        """Return the estimate to publish (its arrival may be in the past).
+
+        The middle of the last ``ESTIMATE_WINDOW`` estimates by arrival; the
+        latest until there are that many. A trip restored without any (saved
+        before 2.4.0) has only its own until the next fix.
+        """
+        estimates = self._estimates
+        if not estimates:
+            return self._current_estimate()
+        if len(estimates) < ESTIMATE_WINDOW:
+            return estimates[-1]
+        return sorted(estimates, key=lambda estimate: estimate.arrival)[
+            ESTIMATE_WINDOW // 2
+        ]
+
+    def _judged_arrival(self) -> float | None:
+        """Return the arrival arriving soon and the overdue rule go by.
+
+        The later of the one published and the newest. Arriving soon stays on
+        once on, and the overdue rule ends the trip home: neither may act on
+        an estimate the next fix may still drop (one far earlier than the two
+        before it), nor on one the newest fix already shows to be out of date
+        (the person has slowed down). So, but for a restart (the saved
+        estimates then stand in for the typical speed), neither comes earlier
+        than when each estimate was used as it came, before 2.4.0.
+        """
+        newest = self._estimates[-1] if self._estimates else self._current_estimate()
+        arrivals = [
+            estimate.arrival
+            for estimate in (self._estimate(), newest)
+            if estimate is not None
+        ]
+        return max(arrivals, default=None)
 
     # -- output ----------------------------------------------------------
 
@@ -1046,18 +1185,17 @@ class HomewardTracker:
     def snapshot(self, now: float) -> HomewardSnapshot:
         """Return what to publish at ``now``."""
         arrival: float | None = None
-        speed: tuple[float, SpeedSource] | None = None
+        estimate: HomewardEstimate | None = None
         if self._heading:
-            raw = self._raw_arrival()
-            speed = self._expected_speed()
-            arrival = None if raw is None else max(raw, now)
+            estimate = self._estimate()
+            arrival = None if estimate is None else max(estimate.arrival, now)
         return HomewardSnapshot(
             heading=self._heading,
             reason=self._reason,
             since=self._since,
             arrival=arrival,
-            speed_mps=None if speed is None else speed[0],
-            speed_source=None if speed is None else speed[1],
+            speed_mps=None if estimate is None else estimate.speed_mps,
+            speed_source=None if estimate is None else estimate.source,
             farthest_m=None if self._home else self._farthest_m,
             still_since=self.still_since(now),
             arriving_soon=self._soon,
@@ -1118,6 +1256,37 @@ def near_home(distance_m: float, config: NearHomeConfig) -> float:
 
 def _ground_m(a: _Fix, b: _Fix) -> float:
     return haversine_m(a.latitude, a.longitude, b.latitude, b.longitude)
+
+
+_SOURCES = frozenset(source.value for source in SpeedSource)
+
+
+def _estimates_from(value: object) -> tuple[HomewardEstimate, ...]:
+    """Return estimates read back from storage; none when any is unusable.
+
+    They only make sense together (the middle one is published), so a list
+    with a bad entry is dropped whole, as is one that is not a list (data
+    saved before 2.4.0 has none).
+    """
+    if not isinstance(value, list):
+        return ()
+    estimates: list[HomewardEstimate] = []
+    for item in value[-ESTIMATE_WINDOW:]:
+        if not isinstance(item, dict):
+            return ()
+        arrival = _number(item.get("arrival"))
+        speed = _number(item.get("speed_mps"))
+        source = item.get("source")
+        if (
+            arrival is None
+            or speed is None
+            or speed <= 0
+            or not isinstance(source, str)
+            or source not in _SOURCES
+        ):
+            return ()
+        estimates.append(HomewardEstimate(arrival, speed, SpeedSource(source)))
+    return tuple(estimates)
 
 
 def _number(value: object) -> float | None:

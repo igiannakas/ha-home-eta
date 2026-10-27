@@ -65,7 +65,9 @@ It lasts until they get home, or until the trip clearly is not one: they stay at
 
 ### Expected home
 
-The distance over a speed. With no measured speed, the speed is the typical door-to-door speed for a trip home of that length, learned from the person's own trips (below). With one (between rings, or the closing speed), the two are blended, `measured ^ w × typical ^ (1 - w)`, so one fast stretch of motorway or one queue does not swing it; `w` is learned too, and starts at 0.5. Close and slow is walking, and the measured speed is used as it is. At driving speed the typical speed and weight for driving are used. Once someone is clearly closing (above 0.3 m/s), closing faster never means a later expected arrival. The estimate only changes with a new report; between reports the minutes count down, and the expected time never falls in the past.
+The distance over a speed. With no measured speed, the speed is the typical door-to-door speed for a trip home of that length, learned from the person's own trips (below). With one (between rings, or the closing speed), the two are blended, `measured ^ w × typical ^ (1 - w)`, so one fast stretch of motorway or one queue does not swing it; `w` is learned too, and starts at 0.5. Close and slow is walking, and the measured speed is used as it is. At driving speed the typical speed and weight for driving are used. Once someone is clearly closing (above 0.3 m/s), closing faster never means a later expected arrival.
+
+Each report gives an estimate, and in stop-start traffic one of them is often far off and the next report puts it back: a stretch crawled or sped through (the measured speed follows each stretch between reports closely), a gap in reports that leaves no measured speed, or a switch to or from the speed between rings. So the expected arrival is the middle of the last three: one estimate that disagrees with the two before it waits for the next report, and a change the next report confirms follows one report late. An estimate whose time has passed with the person still out no longer counts. Crossing a ring is believed at once, since its speed is measured over kilometres. The status shows the speed behind the estimate shown. The estimate only changes with a new report (a restart is not one: the estimate is kept); between reports the minutes count down, and the expected time never falls in the past.
 
 ### Typical speeds, learned
 
@@ -82,7 +84,7 @@ The built-in values are a starting point: walking under 1 km, a local drive at a
 
 ### Arriving soon
 
-On a trip home, the status becomes `arriving_soon` once the expected arrival is within the person's threshold or they are within 800 m of the zone centre (**Arriving-soon distance** in Advanced). It stays so until they get home or the trip home ends, so an estimate that wobbles around the threshold does not switch it back and forth. Inside any zone other than home it is held off (a shop near home is not arriving home); zones that contain home, such as the rings, do not count. Changing the threshold judges it afresh.
+On a trip home, the status becomes `arriving_soon` once the expected arrival is within the person's threshold or they are within 800 m of the zone centre (**Arriving-soon distance** in Advanced). It stays so until they get home or the trip home ends, so an estimate that wobbles around the threshold does not switch it back and forth. Inside any zone other than home it is held off (a shop near home is not arriving home); zones that contain home, such as the rings, do not count. Changing the threshold judges it afresh. Arriving soon goes by the later of the expected arrival and the newest estimate, and so does ending a trip home that went quiet well past it: neither acts on an estimate that the next report may still drop, nor on one the newest already shows out of date (the person has slowed down).
 
 ### Near home
 
@@ -117,6 +119,8 @@ On the household's own trips of 16-23 October 2026, heading home came on 41 and 
 
 On those trips (16-24 October; four and three trips home learned from, mostly in the same car), each scored with what was learned from all the others, the learned values made the worst estimates better and the typical ones about as good: the 90th-percentile error fell at every distance for both people (5-20 km from 39.6 to 31.1 and from 38.5 to 36.3 minutes, beyond 20 km from 64.9 to 49.9 and from 36.3 to 33.6), while the mean error over every scored report went from 18.1 to 17.2 minutes for one and from 21.3 to 22.5 for the other, whose trips included the one with a long jam (the measured speed was right there, and the other trips had taught it to count for less). What was learned fits the household: driving about 4.5 m/s near home, as built in; any trip faster under 2 km (most trips home there were drives); a measured speed worth less than half (0.3-0.45) between 3 and 35 km, where the road just driven is faster than the road ahead. With so few trips they are still pulled towards the built-in 0.5: a trip counts towards them by how far its measured speeds were from the typical one, not by how many reports it had.
 
+On the household's trips home of 16-27 October 2026 (ten, two people), taking the middle of the last three estimates halved the changes of more than ten minutes from one report to the next (30 to 16; on the drive home through queues of 27 October, 12 to 6 across the two phones), and the mean error went from 18.1 to 17.3 minutes. Heading home and arriving soon came on at the same moments on every trip; on simulated drives arriving soon never came on earlier, and at most a minute later. A change the next report confirms is shown one report late, which on 27 October put the estimate up to 1.4 minutes further off in the last ten minutes.
+
 ## Install
 
 1. In HACS, add `https://github.com/igiannakas/ha-home-eta` as a custom repository of type **Integration**, then install **Home ETA**.
@@ -138,6 +142,11 @@ Renaming a person or a zone is followed automatically. Removing a person takes t
 On iPhones, make sure the Companion app has location set to **Always** with background refresh on.
 
 ## Upgrading
+
+### From 2.3
+
+- **Steadier expected arrival**: it is now the middle of the last three estimates, so one report that is far off no longer moves it (see Expected home). Arriving soon never comes on earlier than before. Nothing to set up.
+- **Kept across a restart**: a trip home in progress now keeps its estimate through a restart until the next report, instead of falling back to the typical speed; arriving soon and the end of a trip home gone quiet go by it too. A trip home in progress during the upgrade restart does fall back, once, as before.
 
 ### From 2.2
 

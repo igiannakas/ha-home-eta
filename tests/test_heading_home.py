@@ -375,7 +375,8 @@ async def test_a_restored_trip_survives_a_second_restart(hass: HomeAssistant) ->
     assert hass.states.get(STATUS).attributes["reason"] == "restored"
     saved = status_sensor(hass).extra_restore_state_data.as_dict()
     assert saved["last_heard"] == now - 120
-    assert saved["trip"] == trip
+    # Saved before 2.4.0: no estimates, and none worked out since (no fix).
+    assert saved["trip"] == {**trip, "estimates": []}
 
 
 async def test_a_saved_stay_with_bad_coordinates_is_ignored(

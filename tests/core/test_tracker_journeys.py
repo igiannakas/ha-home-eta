@@ -136,3 +136,22 @@ def test_a_long_stop_on_the_way_ends_the_trip_home_until_moving_on() -> None:
         assert not any(m.soon for m in stopped), seed
         assert minutes[-1].heading, seed
         assert minutes[-1].soon, seed
+
+
+def test_a_queue_on_the_way_does_not_bring_arriving_soon_early() -> None:
+    """25 km out: 10 km at 13 m/s, 5 km queueing at 1.5 m/s, 10 km at 12 m/s.
+
+    Arriving soon stays on once on, so it must not come on from the estimate
+    made before the queue while the next report may still confirm the queue
+    (the estimate published waits for that; arriving soon goes by the later).
+    """
+    segments = [
+        Segment((15_000.0, 0.0), 13.0),
+        Segment((10_000.0, 0.0), 1.5),
+        Segment((0.0, 0.0), 12.0),
+    ]
+    for seed in SEEDS:
+        minutes = replay((25_000.0, 0.0), segments, IOS, seed)
+        assert stays_on(minutes, "heading"), seed
+        assert stays_on(minutes, "soon"), seed
+        assert 9 * MIN <= lead_s(minutes) <= 16 * MIN, seed

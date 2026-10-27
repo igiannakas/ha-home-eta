@@ -8,6 +8,8 @@ import pytest
 
 from custom_components.home_eta.core.geo import haversine_m
 from custom_components.home_eta.core.homeward import (
+    ESTIMATE_WINDOW,
+    HomewardEstimate,
     HomewardReason,
     HomewardRestore,
     HomewardStay,
@@ -887,3 +889,260 @@ def test_undoing_a_fix_after_a_new_threshold_judges_afresh() -> None:
     tracker.load(saved)
     assert not tracker.arriving_soon
     assert tracker.threshold_s == 5 * MIN
+
+
+# -- the expected arrival published ---------------------------------------------
+
+
+def arrival_at(tracker: HomewardTracker, now: float) -> float:
+    """Return the expected arrival published at ``now``."""
+    arrival = tracker.snapshot(now).arrival
+    assert arrival is not None
+    return arrival
+
+
+def newest(tracker: HomewardTracker) -> float:
+    """Return the estimate worked out at the latest fix (what 2.3 published)."""
+    saved = tracker.restore_data()
+    assert saved is not None
+    assert saved.trip is not None
+    assert saved.trip.estimates
+    return saved.trip.estimates[-1].arrival
+
+
+def drive_home(tracker: HomewardTracker, phone: Phone) -> list[float]:
+    """Head home from 30 km at a steady 13 m/s, a fix every two minutes."""
+    heading_home_from(tracker, phone, 30_000)
+    arrivals = [arrival_at(tracker, phone.t)]
+    for east in (21_000, 19_500):
+        phone.at(east, after_s=2 * MIN, speed=13.0)
+        arrivals.append(arrival_at(tracker, phone.t))
+    return arrivals
+
+
+def test_a_steady_trip_publishes_each_estimate() -> None:
+    tracker, phone = out_of_home()
+    arrivals = drive_home(tracker, phone)
+    assert arrivals[-1] == pytest.approx(newest(tracker), abs=30)
+    assert max(arrivals) - min(arrivals) < 2 * MIN
+
+
+def test_a_lone_estimate_far_off_is_dropped() -> None:
+    """One crawled leg (27 Oct 2026: +36 min, then -38 min at the next fix)."""
+    tracker, phone = out_of_home()
+    steady = drive_home(tracker, phone)[-1]
+    phone.at(19_000, after_s=2 * MIN, speed=1.0)  # one leg in a queue
+    assert newest(tracker) - steady > 30 * MIN
+    assert abs(arrival_at(tracker, phone.t) - steady) < 2 * MIN
+    snap = tracker.snapshot(phone.t)
+    assert snap.speed_mps is not None
+    assert snap.speed_mps > 9.0  # the speed behind the estimate published
+    phone.at(17_500, after_s=2 * MIN, speed=13.0)  # moving again
+    assert abs(arrival_at(tracker, phone.t) - steady) < 2 * MIN
+
+
+def test_a_lone_early_estimate_is_dropped_and_arriving_soon_waits() -> None:
+    """A gap in reports: no measured speed, so one estimate at the typical one."""
+    tracker, phone = out_of_home()
+    for east, speed in ((30_000, -1.0), (22_000, 1.5), (21_700, 1.5), (21_400, 1.5)):
+        phone.at(east, after_s=3 * MIN, speed=speed)
+    assert tracker.heading
+    crawling = arrival_at(tracker, phone.t)
+    assert crawling - phone.t > 60 * MIN
+    tracker.set_threshold(45 * MIN)
+    phone.at(21_100, after_s=3 * MIN, speed=None)  # typical: under 45 min
+    assert newest(tracker) - phone.t < 45 * MIN
+    assert arrival_at(tracker, phone.t) - phone.t > 60 * MIN
+    assert not tracker.arriving_soon
+    phone.wait(2 * MIN)
+    assert not tracker.arriving_soon
+    phone.at(20_800, after_s=MIN, speed=1.5)
+    assert arrival_at(tracker, phone.t) - phone.t > 60 * MIN
+    assert not tracker.arriving_soon
+
+
+def test_a_change_the_next_fix_confirms_follows_one_fix_late() -> None:
+    tracker, phone = out_of_home()
+    steady = drive_home(tracker, phone)[-1]
+    phone.at(19_000, after_s=2 * MIN, speed=1.0)
+    first_slow = newest(tracker)
+    assert abs(arrival_at(tracker, phone.t) - steady) < 2 * MIN
+    phone.at(18_900, after_s=2 * MIN, speed=1.0)  # still crawling
+    assert arrival_at(tracker, phone.t) == pytest.approx(
+        min(first_slow, newest(tracker))
+    )
+    assert arrival_at(tracker, phone.t) - steady > 30 * MIN
+
+
+def test_a_zone_crossing_is_believed_at_once() -> None:
+    """Its speed is measured between zones, over kilometres (27 Oct 17:17)."""
+    tracker, phone = out_of_home()
+    tracker.set_rings([ring(8_000), ring(16_000)])
+    phone.at(20_000, after_s=30 * MIN)
+    phone.at(15_900, after_s=5 * MIN, speed=2.0)  # into the 16 km zone
+    assert tracker.heading
+    for east in (15_000, 14_100):
+        phone.at(east, after_s=5 * MIN, speed=2.0)
+    crawling = arrival_at(tracker, phone.t)
+    phone.at(7_900, after_s=10 * MIN, speed=2.0)  # 8 km in 20 min since 16 km
+    snap = tracker.snapshot(phone.t)
+    assert snap.speed_source is SpeedSource.ZONE_CROSSINGS
+    assert snap.arrival == newest(tracker)
+    assert crawling - snap.arrival > 20 * MIN
+
+
+def test_an_estimate_that_has_passed_no_longer_counts() -> None:
+    tracker, phone = out_of_home()
+    drive_home(tracker, phone)
+    passed = arrival_at(tracker, phone.t)
+    phone.wait(passed - phone.t + 5 * MIN)  # overdue, within the grace
+    assert tracker.heading
+    phone.at(18_000, after_s=0.0, speed=1.0)
+    # The two still standing disagree: the newest is published.
+    assert arrival_at(tracker, phone.t) == newest(tracker)
+    assert arrival_at(tracker, phone.t) > phone.t
+
+
+def test_a_slowdown_does_not_bring_arriving_soon_early() -> None:
+    """Into a jam 15 km out: the estimate before it may be published a fix
+    longer, but arriving soon goes by the later of it and the newest."""
+    tracker, phone = out_of_home()
+    heading_home_from(tracker, phone, 30_000)
+    for east in (20_000, 17_000, 15_000):
+        phone.at(east, after_s=4 * MIN, speed=13.0)
+    assert due_in(tracker, phone.t) > 16 * MIN
+    assert not tracker.arriving_soon
+    phone.at(14_800, after_s=MIN, speed=1.5)  # the jam
+    for _ in range(10):
+        phone.wait(MIN, speed=1.5)
+        assert not tracker.arriving_soon
+
+
+def test_the_overdue_rule_goes_by_the_later_estimate() -> None:
+    tracker, phone = out_of_home()
+    drive_home(tracker, phone)
+    phone.at(18_900, after_s=MIN, speed=0.4)  # a queue: a far later estimate
+    later = newest(tracker)
+    published = arrival_at(tracker, phone.t)
+    assert later - published > 60 * MIN
+    grace = max(P.homeward_overdue_s, P.homeward_overdue_ratio * (later - phone.t))
+    phone.wait(published - phone.t + P.homeward_overdue_s + 5 * MIN)
+    assert tracker.heading
+    phone.wait(later + grace - phone.t + MIN)
+    assert not tracker.heading
+    assert tracker.reason is HomewardReason.OVERDUE
+
+
+def test_estimates_are_kept_three_at_most_and_undone_with_a_fix() -> None:
+    tracker, phone = out_of_home()
+    drive_home(tracker, phone)
+    phone.at(18_000, after_s=2 * MIN, speed=13.0)
+    saved = tracker.restore_data()
+    assert saved is not None
+    assert saved.trip is not None
+    assert len(saved.trip.estimates) == ESTIMATE_WINDOW
+    state = tracker.save()
+    before = tracker.snapshot(phone.t)
+    phone.at(17_000, after_s=MIN, speed=1.0)
+    tracker.load(state)
+    assert tracker.snapshot(phone.t - MIN) == before
+
+
+def test_a_restart_keeps_the_estimate_published() -> None:
+    """Not the typical speed until the next fix: a restart is not a report."""
+    tracker, phone = out_of_home()
+    drive_home(tracker, phone)
+    phone.at(19_000, after_s=2 * MIN, speed=1.0)  # held back
+    published = arrival_at(tracker, phone.t)
+    saved = tracker.restore_data()
+    assert saved is not None
+    restored = HomewardTracker(P, TARGET)
+    assert restored.restore(
+        HomewardRestore.from_dict(saved.as_dict()) or saved, phone.t, 19_000
+    )
+    restored.tick(phone.t + MIN, None)
+    snap = restored.snapshot(phone.t + MIN)
+    assert snap.arrival == pytest.approx(published)
+    assert snap.speed_source is SpeedSource.MEASURED
+    # The next fix joins the saved estimates.
+    Phone(restored, phone.t).at(17_500, after_s=2 * MIN, speed=13.0)
+    assert abs(arrival_at(restored, phone.t + 2 * MIN) - published) < 2 * MIN
+
+
+def test_a_trip_saved_without_estimates_uses_the_typical_speed() -> None:
+    """Saved by 2.3.0 or earlier: as before, until the next fix."""
+    tracker = HomewardTracker(P, TARGET)
+    assert tracker.restore(trip(T0, 30_000, 20_000), T0 + MIN, 21_000)
+    snap = tracker.snapshot(T0 + MIN)
+    assert snap.speed_source is SpeedSource.TYPICAL
+    assert snap.arrival == pytest.approx(
+        T0 + MIN + (21_000 - TARGET.radius_m) / typical_speed_mps(21_000)
+    )
+
+
+def test_a_reload_adds_its_fix_to_the_saved_estimates() -> None:
+    """After a reload the person's state is a fix of this run: it counts."""
+    tracker, phone = out_of_home()
+    heading_home_from(tracker, phone, 30_000)
+    phone.at(21_000, after_s=2 * MIN, speed=13.0)
+    published = arrival_at(tracker, phone.t)
+    saved = tracker.restore_data()
+    assert saved is not None
+    assert saved.trip is not None
+    assert len(saved.trip.estimates) == 2
+    reloaded, reload_phone = out_of_home()
+    reload_phone.t = phone.t
+    reload_phone.at(19_000, after_s=MIN, speed=1.0)  # this run's fix: far later
+    assert reloaded.restore(saved, phone.t, None)
+    data = reloaded.restore_data()
+    assert data is not None
+    assert data.trip is not None
+    assert len(data.trip.estimates) == 3
+    assert newest(reloaded) - published > 30 * MIN
+    # The middle of the three: one of the two saved.
+    assert abs(arrival_at(reloaded, reload_phone.t) - published) < 2 * MIN
+
+
+def test_estimates_round_trip_and_bad_ones_are_dropped_whole() -> None:
+    estimates = (
+        HomewardEstimate(T0 + 1_800, 11.2, SpeedSource.MEASURED),
+        HomewardEstimate(T0 + 1_900, 8.4, SpeedSource.ZONE_CROSSINGS),
+    )
+    data = HomewardRestore(
+        T0, HomewardTrip(T0 - 600, 30_000, 20_000, False, 900, estimates)
+    )
+    assert HomewardRestore.from_dict(data.as_dict()) == data
+    good = data.as_dict()["trip"]
+    assert isinstance(good, dict)
+    for bad in (
+        "x",
+        [{"arrival": T0, "speed_mps": 0, "source": "measured"}],
+        [{"arrival": "soon", "speed_mps": 5, "source": "measured"}],
+        [{"arrival": T0, "speed_mps": 5, "source": "teleport"}],
+        [{"arrival": T0, "speed_mps": 5, "source": 3}],
+        [{"arrival": T0, "speed_mps": 5, "source": "measured"}, "x"],
+    ):
+        restored = HomewardRestore.from_dict(
+            {"last_heard": T0, "trip": {**good, "estimates": bad}}
+        )
+        assert restored is not None
+        assert restored.trip is not None
+        assert restored.trip.estimates == ()
+    many = [
+        {"arrival": T0 + i, "speed_mps": 5.0, "source": "measured"} for i in range(5)
+    ]
+    restored = HomewardRestore.from_dict(
+        {"last_heard": T0, "trip": {**good, "estimates": many}}
+    )
+    assert restored is not None
+    assert restored.trip is not None
+    assert [e.arrival for e in restored.trip.estimates] == [T0 + 2, T0 + 3, T0 + 4]
+
+
+def test_a_trip_home_that_ends_forgets_its_estimates() -> None:
+    tracker, phone = out_of_home()
+    drive_home(tracker, phone)
+    assert len(tracker.diagnostics()["estimates"]) == ESTIMATE_WINDOW  # type: ignore[arg-type]
+    phone.at(25_000, after_s=5 * MIN, speed=-13.0)  # turned back
+    assert not tracker.heading
+    assert tracker.diagnostics()["estimates"] == []
