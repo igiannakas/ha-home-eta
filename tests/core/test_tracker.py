@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from custom_components.home_eta.core.homeward import (
+    ESTIMATE_WINDOW,
     HomewardReason,
     HomewardRestore,
     HomewardTrip,
@@ -211,6 +212,51 @@ def test_restore_homeward_then_overdue_at_once() -> None:
     assert not late.snapshot(T0).heading_home
     assert late.snapshot(T0).homeward.reason is HomewardReason.OVERDUE
     assert not tracker(at_target=True).restore_homeward(data, T0 - 120, T0)
+
+
+@pytest.mark.parametrize(
+    ("more", "last_leg_mps"),
+    [(0, 13.0), (1, 13.0), (2, 13.0), (3, 1.0)],
+    ids=["one", "two", "three", "held-back"],
+)
+def test_a_reload_with_no_new_report_keeps_the_expected_arrival(
+    more: int, last_leg_mps: float
+) -> None:
+    """As the runtime reloads: a new tracker, the person's unchanged state fed
+    as its first fix, then the trip home saved restored. With one to three
+    estimates saved, and with the last held back by a crawled leg."""
+    before = tracker(at_target=True)
+    t = 0.0
+    before.update(away(500, t))  # left home
+    for east in (10_000, 20_000, 30_000):
+        t += 20 * MIN
+        before.update(away(east, t))
+    t += 40 * MIN
+    before.update(away(30_000, t))  # a stay
+    east = 30_000.0
+    while not before.homeward.heading:
+        t += 4 * MIN
+        east -= 13.0 * 240
+        before.update(away(east, t))
+    for leg in range(more):
+        t += 4 * MIN
+        east -= (last_leg_mps if leg == more - 1 else 13.0) * 240
+        before.update(away(east, t))
+    published = before.snapshot(T0 + t)
+    saved = before.homeward.restore_data()
+    assert saved is not None
+    assert saved.trip is not None
+    assert len(saved.trip.estimates) == min(more + 1, ESTIMATE_WINDOW)
+
+    after = tracker()
+    after.update(away(east, t))  # the same report, at the same time
+    data = HomewardRestore.from_dict(saved.as_dict())
+    assert data is not None
+    assert after.restore_homeward(data, data.last_heard, T0 + t)
+    snap = after.snapshot(T0 + t)
+    assert snap.expected_home == published.expected_home
+    assert snap.homeward.speed_source is published.homeward.speed_source
+    assert after.homeward.restore_data() == saved
 
 
 def test_near_home_follows_distance_however_long_the_stay() -> None:

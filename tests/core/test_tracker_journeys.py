@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import statistics
 
 import pytest
 
@@ -142,8 +143,8 @@ def test_a_queue_on_the_way_does_not_bring_arriving_soon_early() -> None:
     """25 km out: 10 km at 13 m/s, 5 km queueing at 1.5 m/s, 10 km at 12 m/s.
 
     Arriving soon stays on once on, so it must not come on from the estimate
-    made before the queue while the next report may still confirm the queue
-    (the estimate published waits for that; arriving soon goes by the later).
+    made before the queue: it goes by the newest, which has the queue (the
+    estimate published still waits a report to confirm it).
     """
     segments = [
         Segment((15_000.0, 0.0), 13.0),
@@ -155,3 +156,36 @@ def test_a_queue_on_the_way_does_not_bring_arriving_soon_early() -> None:
         assert stays_on(minutes, "heading"), seed
         assert stays_on(minutes, "soon"), seed
         assert 9 * MIN <= lead_s(minutes) <= 16 * MIN, seed
+
+
+@pytest.mark.parametrize(
+    ("policy", "least_min", "median_min"),
+    [
+        (FixPolicy(significant_m=3_000.0, background_mean_s=900.0), 3.0, 10.0),
+        (IOS, 7.0, 7.0),
+    ],
+    ids=["every-3-km", "ios"],
+)
+def test_arriving_soon_does_not_wait_a_report_after_a_queue_clears(
+    policy: FixPolicy, least_min: float, median_min: float
+) -> None:
+    """25 km out: 5 km at 13 m/s, queueing to 10 km out, then 20 m/s.
+
+    Home 8 minutes after the queue clears: arriving soon goes by the newest
+    estimate, as before 2.4.0, so it comes on as the reports show the speed-up
+    rather than a report later, when the estimate published has caught up.
+    Replayed: before 2.4.0 at least 3.4 (median 13.8) and 7.3 minutes ahead;
+    going by the estimate published, 0.8 (median 6.5) and 6.9.
+    """
+    segments = [
+        Segment((20_000.0, 0.0), 13.0),
+        Segment((10_000.0, 0.0), 1.5),
+        Segment((0.0, 0.0), 20.0),
+    ]
+    leads = []
+    for seed in SEEDS:
+        minutes = replay((25_000.0, 0.0), segments, policy, seed)
+        assert stays_on(minutes, "soon"), seed
+        leads.append(lead_s(minutes))
+        assert leads[-1] >= least_min * MIN, seed
+    assert statistics.median(leads) >= median_min * MIN

@@ -490,15 +490,88 @@ async def test_no_wrong_status_while_reloading(
     for east in (17_000.0, 14_000.0, 11_000.0, 8_000.0, 5_000.0):
         await step(hass, freezer, ALEX, east, seconds=240)
     await step(hass, freezer, ALEX, 4_000.0, seconds=80)
-    # About 8 minutes at the measured speed; after the reload, with only the
-    # typical speed for 4 km, about 12: within the default 15, not within 5.
-    minutes = int(hass.states.get("sensor.alex_minutes_to_home").state)
-    assert 5 < minutes <= 15
+    # About 8 minutes at the measured speed. The expected arrival keeps it
+    # across the reload, but arriving soon goes by the newest estimate, as
+    # before 2.4.0: after the reload that is the one report fed again, which
+    # gives no speed, so the typical one for 4 km, about 12 minutes: within
+    # the default 15, not within 5.
+    minutes = hass.states.get("sensor.alex_minutes_to_home").state
+    assert 5 < int(minutes) <= 15
     assert hass.states.get(STATUS).state == "heading_home"
     seen = record(hass, STATUS, SOMEONE_SOON)
     with set_up_late(number_platform):
         await hass.config_entries.async_reload(alex.entry_id)
         await hass.async_block_till_done()
     assert hass.states.get(STATUS).state == "heading_home"
+    assert hass.states.get(STATUS).attributes["speed_source"] == "measured"
+    assert hass.states.get("sensor.alex_minutes_to_home").state == minutes
     assert (STATUS, "arriving_soon") not in seen
     assert (SOMEONE_SOON, STATE_ON) not in seen
+
+
+@pytest.mark.parametrize("held_back", [False, True], ids=["steady", "held-back"])
+async def test_a_reload_with_no_new_report_keeps_the_expected_arrival(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, held_back: bool
+) -> None:
+    """A reload (an options change, say) is not a report: nothing moves."""
+    set_person(hass, ALEX, 30_000)
+    alex = person_entry(ALEX)
+    await setup_entries(hass, alex, group_entry([ALEX]))
+    east = 30_000.0
+    for _ in range(6):
+        east -= 12.5 * 240
+        await step(hass, freezer, ALEX, east, seconds=240)
+    if held_back:
+        east -= 300  # one leg in a queue: an estimate the next report may drop
+        await step(hass, freezer, ALEX, east, seconds=240)
+    assert heading(hass)
+    watched = (EXPECTED, STATUS, "sensor.home_eta_expected_home")
+    before = {entity_id: hass.states.get(entity_id) for entity_id in watched}
+    saved = status_sensor(hass).extra_restore_state_data.as_dict()
+    await hass.config_entries.async_reload(alex.entry_id)
+    await hass.async_block_till_done()
+    for entity_id, state in before.items():
+        assert hass.states.get(entity_id).state == state.state, entity_id
+    status = hass.states.get(STATUS).attributes
+    assert status["speed_mps"] == before[STATUS].attributes["speed_mps"]
+    assert status["speed_source"] == before[STATUS].attributes["speed_source"]
+    assert status_sensor(hass).extra_restore_state_data.as_dict() == saved
+
+
+async def test_a_saved_estimate_no_trip_home_could_take_is_dropped(
+    hass: HomeAssistant,
+) -> None:
+    """Finite but absurd, read back from disk: not shown, and nothing breaks."""
+    now = dt_util.utcnow().timestamp()
+    restore(
+        hass,
+        {
+            "last_heard": now - 120,
+            "trip": {
+                "since": now - 600,
+                "farthest_m": 30_000,
+                "closest_m": 20_000,
+                "arriving_soon": False,
+                "threshold_s": 900,
+                "estimates": [
+                    {"arrival": 1e12, "speed_mps": 10.0, "source": "measured"}
+                ],
+            },
+            "stay": None,
+        },
+    )
+    hass.set_state(CoreState.starting)
+    set_person(hass, ALEX, 21_000)
+    group = group_entry([ALEX])
+    await setup_entries(hass, person_entry(ALEX), group)
+    assert group.state is ConfigEntryState.LOADED
+    state = hass.states.get(STATUS)
+    assert state.attributes["reason"] == "restored"
+    assert state.attributes["speed_source"] == "typical"
+    expected = dt_util.parse_datetime(hass.states.get(EXPECTED).state)
+    assert expected is not None
+    assert expected.timestamp() < now + 4 * 3_600
+    group_expected = hass.states.get("sensor.home_eta_expected_home").state
+    assert dt_util.parse_datetime(group_expected) == expected
+    saved = status_sensor(hass).extra_restore_state_data.as_dict()
+    assert saved["trip"]["estimates"] == []

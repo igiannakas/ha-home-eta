@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 
 import pytest
@@ -12,6 +13,7 @@ from custom_components.home_eta.core.homeward import (
     HomewardEstimate,
     HomewardReason,
     HomewardRestore,
+    HomewardSnapshot,
     HomewardStay,
     HomewardTracker,
     HomewardTrip,
@@ -641,15 +643,17 @@ def due_in(tracker: HomewardTracker, now: float) -> float:
 
 
 def test_arriving_soon_once_due_within_the_threshold() -> None:
+    """By the newest estimate: the one published may still be a fix behind."""
     tracker, phone = out_of_home()
     tracker.set_threshold(10 * MIN)
     heading_home_from(tracker, phone, 30_000)
     east = 22_500.0
     while not tracker.arriving_soon:
-        assert due_in(tracker, phone.t) > 10 * MIN
+        assert newest(tracker) - phone.t > 10 * MIN
         east -= 1_000
         phone.at(east, after_s=77.0, speed=13.0)
-    assert due_in(tracker, phone.t) <= 10 * MIN
+    assert newest(tracker) - phone.t <= 10 * MIN
+    assert due_in(tracker, phone.t) - 10 * MIN < MIN
     assert east > P.arriving_soon_distance_m
     assert tracker.snapshot(phone.t).arriving_soon
 
@@ -901,13 +905,19 @@ def arrival_at(tracker: HomewardTracker, now: float) -> float:
     return arrival
 
 
-def newest(tracker: HomewardTracker) -> float:
-    """Return the estimate worked out at the latest fix (what 2.3 published)."""
+def estimates_of(tracker: HomewardTracker) -> tuple[HomewardEstimate, ...]:
+    """Return the estimates kept for the trip home, oldest first."""
     saved = tracker.restore_data()
     assert saved is not None
     assert saved.trip is not None
-    assert saved.trip.estimates
-    return saved.trip.estimates[-1].arrival
+    return saved.trip.estimates
+
+
+def newest(tracker: HomewardTracker) -> float:
+    """Return the estimate worked out at the latest fix (what 2.3 published)."""
+    estimates = estimates_of(tracker)
+    assert estimates
+    return estimates[-1].arrival
 
 
 def drive_home(tracker: HomewardTracker, phone: Phone) -> list[float]:
@@ -941,24 +951,31 @@ def test_a_lone_estimate_far_off_is_dropped() -> None:
     assert abs(arrival_at(tracker, phone.t) - steady) < 2 * MIN
 
 
-def test_a_lone_early_estimate_is_dropped_and_arriving_soon_waits() -> None:
-    """A gap in reports: no measured speed, so one estimate at the typical one."""
-    tracker, phone = out_of_home()
+def crawl_then_a_gap(tracker: HomewardTracker, phone: Phone) -> None:
+    """Crawling 22 km out, then a fix after a gap: one at the typical speed."""
     for east, speed in ((30_000, -1.0), (22_000, 1.5), (21_700, 1.5), (21_400, 1.5)):
         phone.at(east, after_s=3 * MIN, speed=speed)
     assert tracker.heading
-    crawling = arrival_at(tracker, phone.t)
-    assert crawling - phone.t > 60 * MIN
-    tracker.set_threshold(45 * MIN)
-    phone.at(21_100, after_s=3 * MIN, speed=None)  # typical: under 45 min
-    assert newest(tracker) - phone.t < 45 * MIN
     assert arrival_at(tracker, phone.t) - phone.t > 60 * MIN
-    assert not tracker.arriving_soon
-    phone.wait(2 * MIN)
-    assert not tracker.arriving_soon
+    phone.at(21_100, after_s=3 * MIN, speed=None)  # no measured speed
+
+
+def test_a_lone_early_estimate_is_dropped_but_arriving_soon_goes_by_it() -> None:
+    """Arriving soon is exactly as before 2.4.0: the newest estimate decides.
+
+    The cost of not waiting a fix to confirm a speed-up (a queue that has
+    cleared), which heating on the way home needs: one early estimate the next
+    fix drops can still bring it on.
+    """
+    tracker, phone = out_of_home()
+    tracker.set_threshold(45 * MIN)
+    crawl_then_a_gap(tracker, phone)
+    assert newest(tracker) - phone.t < 45 * MIN
+    assert arrival_at(tracker, phone.t) - phone.t > 60 * MIN  # not published
+    assert tracker.arriving_soon
     phone.at(20_800, after_s=MIN, speed=1.5)
     assert arrival_at(tracker, phone.t) - phone.t > 60 * MIN
-    assert not tracker.arriving_soon
+    assert tracker.arriving_soon  # on until the trip home ends
 
 
 def test_a_change_the_next_fix_confirms_follows_one_fix_late() -> None:
@@ -1005,7 +1022,7 @@ def test_an_estimate_that_has_passed_no_longer_counts() -> None:
 
 def test_a_slowdown_does_not_bring_arriving_soon_early() -> None:
     """Into a jam 15 km out: the estimate before it may be published a fix
-    longer, but arriving soon goes by the later of it and the newest."""
+    longer, but arriving soon goes by the newest, which has the jam."""
     tracker, phone = out_of_home()
     heading_home_from(tracker, phone, 30_000)
     for east in (20_000, 17_000, 15_000):
@@ -1018,7 +1035,7 @@ def test_a_slowdown_does_not_bring_arriving_soon_early() -> None:
         assert not tracker.arriving_soon
 
 
-def test_the_overdue_rule_goes_by_the_later_estimate() -> None:
+def test_the_overdue_rule_waits_for_a_later_newest_estimate() -> None:
     tracker, phone = out_of_home()
     drive_home(tracker, phone)
     phone.at(18_900, after_s=MIN, speed=0.4)  # a queue: a far later estimate
@@ -1031,6 +1048,22 @@ def test_the_overdue_rule_goes_by_the_later_estimate() -> None:
     phone.wait(later + grace - phone.t + MIN)
     assert not tracker.heading
     assert tracker.reason is HomewardReason.OVERDUE
+
+
+def test_the_overdue_rule_goes_by_an_earlier_newest_estimate() -> None:
+    """As before 2.4.0, not by the later one published."""
+    tracker, phone = out_of_home()
+    crawl_then_a_gap(tracker, phone)
+    early = newest(tracker)
+    published = arrival_at(tracker, phone.t)
+    assert published - early > 30 * MIN
+    grace = max(P.homeward_overdue_s, P.homeward_overdue_ratio * (early - phone.t))
+    phone.wait(early + grace - phone.t - MIN)
+    assert tracker.heading
+    phone.wait(2 * MIN)
+    assert not tracker.heading
+    assert tracker.reason is HomewardReason.OVERDUE
+    assert phone.t < published
 
 
 def test_estimates_are_kept_three_at_most_and_undone_with_a_fix() -> None:
@@ -1080,8 +1113,39 @@ def test_a_trip_saved_without_estimates_uses_the_typical_speed() -> None:
     )
 
 
-def test_a_reload_adds_its_fix_to_the_saved_estimates() -> None:
-    """After a reload the person's state is a fix of this run: it counts."""
+def reloaded_with(saved: HomewardRestore, east_m: float, t: float) -> HomewardTracker:
+    """Return a tracker reloaded as the runtime does it: the person's state fed
+    as this run's first fix (at ``t``, ``east_m`` out), then the trip restored."""
+    reloaded, phone = out_of_home()
+    phone.t = t
+    phone.at(east_m, after_s=0.0)
+    data = HomewardRestore.from_dict(saved.as_dict())
+    assert data is not None
+    assert reloaded.restore(data, data.last_heard, None)
+    return reloaded
+
+
+@pytest.mark.parametrize("held_back", [False, True])
+def test_a_reload_with_no_new_report_keeps_the_estimate_published(
+    held_back: bool,
+) -> None:
+    """The same report fed again is not a new one: nothing it says is counted twice."""
+    tracker, phone = out_of_home()
+    drive_home(tracker, phone)
+    east = 18_000.0 if held_back else 17_940.0
+    phone.at(east, after_s=2 * MIN, speed=1.0 if held_back else 13.0)
+    published = tracker.snapshot(phone.t)
+    saved = tracker.restore_data()
+    assert saved is not None
+    reloaded = reloaded_with(saved, east, phone.t)
+    snap = reloaded.snapshot(phone.t)
+    assert snap.reason is HomewardReason.RESTORED
+    assert replace(snap, reason=published.reason) == published
+    assert reloaded.restore_data() == saved
+
+
+def test_a_newer_report_at_a_reload_joins_the_saved_estimates() -> None:
+    """One the last run never had (it came in during the reload): it counts."""
     tracker, phone = out_of_home()
     heading_home_from(tracker, phone, 30_000)
     phone.at(21_000, after_s=2 * MIN, speed=13.0)
@@ -1146,3 +1210,189 @@ def test_a_trip_home_that_ends_forgets_its_estimates() -> None:
     phone.at(25_000, after_s=5 * MIN, speed=-13.0)  # turned back
     assert not tracker.heading
     assert tracker.diagnostics()["estimates"] == []
+
+
+def crossing_into_2_km(ring_speed_mps: float) -> HomewardSnapshot:
+    """Heading home 5 km out at 6 m/s, into the 4 and then the 2 km zone.
+
+    All is the same but when the 4 km zone was crossed, so the speed between
+    the zones is ``ring_speed_mps``; the fix into the 2 km zone is at the same
+    time and place either way. Within 3 km under 2.5 m/s is on foot, so the
+    ring-to-ring speed gives an estimate on foot on one side and a measured
+    one on the other.
+    """
+    tracker, phone = out_of_home()
+    tracker.set_rings([ring(2_000), ring(4_000)])
+    phone.at(10_000, after_s=30 * MIN)
+    phone.at(9_000, after_s=60 * MIN)  # a stay
+    phone.at(7_000, after_s=5 * MIN, speed=6.0)
+    phone.at(5_000, after_s=5 * MIN, speed=6.0)
+    assert tracker.heading
+    into_2_km = phone.t + 2_000.0 / 3.0
+    into_4_km = into_2_km - 2_000.0 / ring_speed_mps
+    phone.at(4_400, after_s=into_4_km - 60 - phone.t, speed=6.0)
+    phone.at(3_990, after_s=60, speed=6.0)
+    phone.at(3_000, after_s=into_2_km - 200 - phone.t, speed=6.0)
+    phone.at(2_400, after_s=100, speed=6.0)
+    phone.at(1_999, after_s=100, speed=6.0)
+    assert phone.t == into_2_km
+    return tracker.snapshot(phone.t)
+
+
+def test_closing_faster_between_zones_never_publishes_a_later_arrival() -> None:
+    slower = crossing_into_2_km(2.4)
+    faster = crossing_into_2_km(2.6)
+    assert slower.speed_source is SpeedSource.ON_FOOT
+    assert faster.speed_source is SpeedSource.ZONE_CROSSINGS
+    assert slower.arrival is not None
+    assert faster.arrival is not None
+    assert faster.arrival <= slower.arrival
+
+
+def test_an_estimate_that_passes_between_reports_no_longer_counts() -> None:
+    """A queue and no report for 14 minutes (an iPhone standing still)."""
+    tracker, phone = out_of_home()
+    tracker.set_threshold(5 * MIN)
+    phone.at(12_000, after_s=30 * MIN)
+    phone.at(12_000, after_s=60 * MIN)  # a stay
+    for east in (9_000, 7_500, 6_000):
+        phone.at(east, after_s=3 * MIN, speed=7.5)
+    assert tracker.heading
+    phone.at(5_950, after_s=2 * MIN, speed=0.5)  # the queue: far later
+    queue = newest(tracker)
+    before = arrival_at(tracker, phone.t)
+    assert queue - before > 20 * MIN
+    for _ in range(14):
+        phone.wait(MIN, speed=0.5)
+        published = arrival_at(tracker, phone.t)
+        assert published > phone.t or published == queue
+        assert published in (before, queue)
+    assert arrival_at(tracker, phone.t) == queue
+    assert not tracker.arriving_soon
+
+
+def test_all_estimates_passed_publishes_now() -> None:
+    tracker, phone = out_of_home()
+    drive_home(tracker, phone)
+    latest = max(estimate.arrival for estimate in estimates_of(tracker))
+    phone.wait(latest - phone.t + MIN)
+    assert tracker.heading
+    snap = tracker.snapshot(phone.t)
+    assert snap.arrival == phone.t
+    assert snap.speed_mps == pytest.approx(13.0, abs=3)
+
+
+def saved_trip(*arrivals: float, last_heard: float = T0) -> HomewardRestore:
+    """Return a trip home saved at ``last_heard`` with these estimates."""
+    estimates = [
+        {"arrival": arrival, "speed_mps": 10.0, "source": "measured"}
+        for arrival in arrivals
+    ]
+    data = HomewardRestore.from_dict(
+        {
+            "last_heard": last_heard,
+            "trip": {
+                "since": last_heard - 600,
+                "farthest_m": 30_000,
+                "closest_m": 20_000,
+                "arriving_soon": False,
+                "threshold_s": 900,
+                "estimates": estimates,
+            },
+            "stay": None,
+        }
+    )
+    assert data is not None
+    assert data.trip is not None
+    assert len(data.trip.estimates) == len(arrivals)
+    return data
+
+
+@pytest.mark.parametrize(
+    "arrivals",
+    [
+        (1e12,),  # finite, but far beyond any trip home
+        (T0 + 1_800, T0 + 1_900, T0 + P.max_eta_s + 1),
+        (T0 - 1, T0 + 1_800, T0 + 1_900),  # due before it was worked out
+    ],
+)
+def test_restored_estimates_this_tracker_could_not_have_written_are_dropped(
+    arrivals: tuple[float, ...],
+) -> None:
+    """All of them: they only make sense together. The typical speed stands in."""
+    tracker = HomewardTracker(P, TARGET)
+    assert tracker.restore(saved_trip(*arrivals), T0, 20_000)
+    snap = tracker.snapshot(T0 + MIN)
+    assert snap.speed_source is SpeedSource.TYPICAL
+    assert snap.arrival == pytest.approx(
+        T0 + (20_000 - TARGET.radius_m) / typical_speed_mps(20_000)
+    )
+    data = tracker.restore_data()
+    assert data is not None
+    assert data.trip is not None
+    assert data.trip.estimates == ()
+
+
+def test_restored_estimates_at_their_limits_are_kept() -> None:
+    tracker = HomewardTracker(P, TARGET)
+    arrivals = (T0, T0 + 1_800, T0 + P.max_eta_s)
+    assert tracker.restore(saved_trip(*arrivals), T0, 20_000)
+    data = tracker.restore_data()
+    assert data is not None
+    assert data.trip is not None
+    assert [e.arrival for e in data.trip.estimates] == list(arrivals)
+    assert arrival_at(tracker, T0) == T0 + 1_800
+
+
+def test_as_estimates_pass_the_newest_left_is_published() -> None:
+    """Two left disagree, as at the start of a trip home: the newer is believed.
+
+    Once all have passed, the newest, shown as "now" with its speed.
+    """
+    data = HomewardRestore.from_dict(
+        {
+            "last_heard": T0,
+            "trip": {
+                "since": T0 - 600,
+                "farthest_m": 30_000,
+                "closest_m": 20_000,
+                "estimates": [
+                    {"arrival": T0 + 1_800, "speed_mps": 11.0, "source": "measured"},
+                    {"arrival": T0 + 600, "speed_mps": 3.0, "source": "typical"},
+                    {"arrival": T0 + 1_200, "speed_mps": 9.0, "source": "on_foot"},
+                ],
+            },
+        }
+    )
+    assert data is not None
+    tracker = HomewardTracker(P, TARGET)
+    assert tracker.restore(data, T0, 20_000)
+    assert arrival_at(tracker, T0 + 500) == T0 + 1_200
+    assert arrival_at(tracker, T0 + 700) == T0 + 1_200  # the newest of the two
+    assert arrival_at(tracker, T0 + 1_300) == T0 + 1_800
+    snap = tracker.snapshot(T0 + 1_900)
+    assert snap.arrival == T0 + 1_900
+    assert snap.speed_source is SpeedSource.ON_FOOT
+    assert snap.speed_mps == 9.0
+
+
+def test_arriving_soon_comes_on_at_the_report_that_a_queue_has_cleared() -> None:
+    """As before 2.4.0: heating on the way home must not wait a report more.
+
+    A queue at 2 m/s from 14 to 12 km out, then 20 m/s: the next report, 4
+    minutes later, is 7.2 km out and 5.7 minutes from home.
+    """
+    tracker, phone = out_of_home()
+    phone.at(20_000, after_s=30 * MIN)
+    phone.at(20_000, after_s=60 * MIN)  # a stay
+    for east in (17_000, 14_000):
+        phone.at(east, after_s=4 * MIN, speed=13.0)
+    for east in (13_500, 13_000, 12_500, 12_000):
+        phone.at(east, after_s=4 * MIN, speed=2.0)
+    assert tracker.heading
+    assert not tracker.arriving_soon
+    phone.at(7_200, after_s=4 * MIN, speed=20.0)
+    assert newest(tracker) - phone.t <= tracker.threshold_s
+    # Still the queue: the speed-up waits for the next report to be published.
+    assert arrival_at(tracker, phone.t) - phone.t > tracker.threshold_s
+    assert tracker.arriving_soon

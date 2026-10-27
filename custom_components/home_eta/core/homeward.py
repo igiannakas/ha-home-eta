@@ -20,16 +20,18 @@ questions:
   typical speeds are learned from the person's own trips home
   (``core/calibration.py``): each completed trip is handed over for that.
   What is published is the middle of the last three estimates worked out at
-  fixes (``ESTIMATE_WINDOW``), so one estimate that disagrees with the two
-  before it waits for the next fix to confirm it; a zone crossing, whose
-  speed is measured over kilometres, is believed at once.
-- **Is the person arriving soon?** On a trip home, once the expected arrival
-  is within the person's threshold or they are within 800 m, unless they are
-  inside another zone (a shop near home). It then stays on until the trip
-  home ends, so an estimate that wobbles round the threshold does not flap.
-  It goes by the later of the estimate published and the newest, as does the
-  rule that ends a trip home gone quiet: neither acts on an estimate the next
-  fix may still drop, nor on one the newest already shows out of date.
+  fixes (``ESTIMATE_WINDOW``) that have not yet passed, so one estimate that
+  disagrees with the two before it waits for the next fix to confirm it; a
+  zone crossing whose ring-to-ring speed is in use, a speed measured over
+  kilometres, is believed at once.
+- **Is the person arriving soon?** On a trip home, once the newest estimate
+  (that of the last fix alone, not the one published) is within the person's
+  threshold or they are within 800 m, unless they are inside another zone (a
+  shop near home). It then stays on until the trip home ends, so an estimate
+  that wobbles round the threshold does not flap. The rule that ends a trip
+  home gone quiet goes by the newest estimate too. Both are exactly as before
+  the published estimate was smoothed (2.3.0): heating that comes on as a
+  queue clears must not wait for the next fix to confirm it.
 
 A "place" is where the person stayed: a fix within ``place_radius_m`` (or
 ``place_accuracy_factor`` times its accuracy) of where they were at least
@@ -71,6 +73,10 @@ MAX_TRIP_SAMPLES = 360
 ESTIMATE_WINDOW = 3
 """The expected arrival published is the middle one of the last this many.
 
+Only the expected arrival published: arriving soon and the overdue rule go by
+the newest estimate, as they did before 2.4.0, so they come on and end at the
+same moments as then.
+
 Each fix gives an estimate: the distance over the speed expected for the rest
 of the trip. In stop-start traffic one of them is often far off and the next
 puts it back: one leg crawled or sped through (the closing speed is measured
@@ -79,7 +85,7 @@ constant), a gap in reports that leaves no measured speed (the typical one is
 used until the next fix), or a switch between those and the speed between
 zones. The middle of three drops such a lone estimate, and follows a change
 that the next fix confirms one fix late (a steady drift too: on 27 October
-2026 that put the estimate up to 1.4 minutes further off in the last ten).
+2026 the fix four minutes from home went from spot on to 2.6 minutes off).
 Three is the fewest that can tell which of two disagreeing estimates is the
 odd one; five left more changes (20 rather than 16) and lags two fixes.
 Replayed on the household's trips home of 16-27 October 2026 (ten, two
@@ -134,7 +140,8 @@ class HomewardSnapshot:
     arrival: float | None
     """Expected arrival (never in the past), only while heading home.
 
-    The middle of the last ``ESTIMATE_WINDOW`` estimates worked out at fixes.
+    The middle of the last ``ESTIMATE_WINDOW`` estimates worked out at fixes,
+    leaving out those that have passed.
     """
     speed_mps: float | None
     """The speed behind ``arrival`` (that of the estimate published)."""
@@ -616,8 +623,10 @@ class HomewardTracker:
         """Use these typical speeds from the next fix on.
 
         The estimates worked out at fixes stand until the next one. Only a
-        trip restored without any (saved before 2.4.0), with no fix yet,
-        uses the new typical speed at once (it has no speed of its own).
+        trip restored with no fix yet, which has no speed of its own, uses the
+        new typical speed at once: for arriving soon and the overdue rule, and
+        for the expected arrival when it was saved without estimates (before
+        2.4.0).
         """
         self._curves = curves
 
@@ -673,10 +682,12 @@ class HomewardTracker:
             self._heading = True
             self._reason = HomewardReason.RESTORED
             self._since = trip.since
-            self._estimates = trip.estimates[-ESTIMATE_WINDOW:]
-            if last is not None:
-                # After a reload the person's state is a fix of this run: its
-                # estimate joins the saved ones.
+            self._estimates = self._saved_estimates(trip, data.last_heard)
+            if last is not None and last.t > data.last_heard:
+                # After a reload the person's state is a fix of this run. One
+                # newer than the last one heard of is a report the saved
+                # estimates do not include, so its estimate joins them; the
+                # same report fed again (a reload with nothing new) is not.
                 self._note_estimate(last.t, crossing=False)
             self._soon = trip.arriving_soon
             saved = trip.threshold_s
@@ -842,12 +853,12 @@ class HomewardTracker:
             return
         self._confirm_quiet_stay(now)
         if new_fix and self._heading:
-            # A crossing whose ring-to-ring speed is in use: a speed measured
-            # over kilometres, believed at once.
-            crossing = bool(entered) and (
-                self._trip_speed is not None
-                and self._trip_speed[1] is SpeedSource.ZONE_CROSSINGS
-            )
+            # A crossing whose ring-to-ring speed is in use (whatever speed it
+            # gives: on foot near home, say), a speed measured over
+            # kilometres, is believed at once. Whether it is believed must not
+            # hang on the speed itself, or closing faster could mean a later
+            # arrival.
+            crossing = bool(entered) and self._ring_speed(now) is not None
             self._note_estimate(now, crossing=crossing)
         self._judge_heading(now, distance, speed_mps, entered, left_trigger)
         self._judge_soon(now, distance)
@@ -867,7 +878,7 @@ class HomewardTracker:
                 distance if self._closest_m is None else min(self._closest_m, distance)
             )
             self._closest_m = closest
-            arrival = self._judged_arrival()
+            arrival = self._newest_arrival()
             last_time = self._last_time()
             grace = (
                 p.homeward_overdue_s
@@ -915,7 +926,7 @@ class HomewardTracker:
             return
         if self._soon:
             return
-        arrival = self._judged_arrival()
+        arrival = self._newest_arrival()
         self._soon = distance <= self._p.arriving_soon_distance_m or (
             arrival is not None and arrival - now <= self._threshold_s
         )
@@ -1134,40 +1145,60 @@ class HomewardTracker:
         kept = () if crossing else tuple(e for e in self._estimates if e.arrival >= now)
         self._estimates = (*kept, current)[-ESTIMATE_WINDOW:]
 
-    def _estimate(self) -> HomewardEstimate | None:
-        """Return the estimate to publish (its arrival may be in the past).
+    def _estimate(self, now: float) -> HomewardEstimate | None:
+        """Return the estimate to publish at ``now`` (its arrival may be past).
 
-        The middle of the last ``ESTIMATE_WINDOW`` estimates by arrival; the
-        latest until there are that many. A trip restored without any (saved
-        before 2.4.0) has only its own until the next fix.
+        The middle by arrival of the last ``ESTIMATE_WINDOW`` estimates that
+        have not passed by ``now``; the latest of them until there are that
+        many. An estimate whose time has passed with the person still out is
+        known to be wrong, between fixes as at one, so the one published
+        moves on to the next rather than sit at "now". Once all have passed,
+        the newest (the snapshot shows "now", as before 2.4.0). A trip
+        restored without any (saved before 2.4.0) has only its own until the
+        next fix.
         """
         estimates = self._estimates
         if not estimates:
             return self._current_estimate()
-        if len(estimates) < ESTIMATE_WINDOW:
+        live = [estimate for estimate in estimates if estimate.arrival >= now]
+        if not live:
             return estimates[-1]
-        return sorted(estimates, key=lambda estimate: estimate.arrival)[
-            ESTIMATE_WINDOW // 2
-        ]
+        if len(live) < ESTIMATE_WINDOW:
+            return live[-1]
+        return sorted(live, key=lambda estimate: estimate.arrival)[ESTIMATE_WINDOW // 2]
 
-    def _judged_arrival(self) -> float | None:
+    def _newest_arrival(self) -> float | None:
         """Return the arrival arriving soon and the overdue rule go by.
 
-        The later of the one published and the newest. Arriving soon stays on
-        once on, and the overdue rule ends the trip home: neither may act on
-        an estimate the next fix may still drop (one far earlier than the two
-        before it), nor on one the newest fix already shows to be out of date
-        (the person has slowed down). So, but for a restart (the saved
-        estimates then stand in for the typical speed), neither comes earlier
-        than when each estimate was used as it came, before 2.4.0.
+        The newest estimate, from the last fix alone (or, restored with no fix
+        yet, from the distance saved at the typical speed): exactly what both
+        went by before 2.4.0. Not the one published, which follows a change
+        one fix late: arriving soon would wait a fix after a queue clears
+        (heating that should be on is not), and the overdue rule would end a
+        trip home by an estimate the newest already shows to be out of date.
         """
-        newest = self._estimates[-1] if self._estimates else self._current_estimate()
-        arrivals = [
-            estimate.arrival
-            for estimate in (self._estimate(), newest)
-            if estimate is not None
-        ]
-        return max(arrivals, default=None)
+        current = self._current_estimate()
+        return None if current is None else current.arrival
+
+    def _saved_estimates(
+        self, trip: HomewardTrip, last_heard: float
+    ) -> tuple[HomewardEstimate, ...]:
+        """Return the estimates of a restored trip home, checked.
+
+        Each one this tracker writes is due no earlier than the fix it was
+        worked out at (and those that have passed by the next fix are dropped
+        then), and no later than ``max_eta_s`` after it: all lie between when
+        the person was last heard from and ``max_eta_s`` after. One that does
+        not could not have been written by this tracker (a corrupt or edited
+        file), so none of the list is trusted: they only make sense together,
+        as when one cannot be read at all (``_estimates_from``). The trip then
+        has the typical speed until its next fix.
+        """
+        estimates = trip.estimates[-ESTIMATE_WINDOW:]
+        latest = last_heard + self._p.max_eta_s
+        if all(last_heard <= e.arrival <= latest for e in estimates):
+            return estimates
+        return ()
 
     # -- output ----------------------------------------------------------
 
@@ -1187,7 +1218,7 @@ class HomewardTracker:
         arrival: float | None = None
         estimate: HomewardEstimate | None = None
         if self._heading:
-            estimate = self._estimate()
+            estimate = self._estimate(now)
             arrival = None if estimate is None else max(estimate.arrival, now)
         return HomewardSnapshot(
             heading=self._heading,
