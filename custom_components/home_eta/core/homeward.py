@@ -1211,9 +1211,11 @@ class HomewardTracker:
         2.4.0) has only its own until the next fix.
 
         Moving on keeps a passed estimate from standing at "now" while a later
-        one is known, at a cost: closing faster makes the one shown pass
-        sooner, so between fixes a faster trip can show the later arrival for
-        a while. At a fix, closing faster never means a later arrival.
+        one is known, at a cost: closing faster makes earlier estimates pass
+        sooner, so a faster trip can show the later arrival for a while, at a
+        fix (fewer live estimates left, so the newer of two rather than the
+        middle of three) or between fixes.  The estimate worked out at a fix
+        itself is never later for closing faster.
         """
         estimates = self._estimates
         if not estimates:
