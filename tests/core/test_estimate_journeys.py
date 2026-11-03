@@ -34,7 +34,8 @@ RINGS = tuple(
 )
 
 # (seconds, metres from home, reported accuracy in metres[, home])
-IOANNIS = [
+# One phone reports every few minutes at 10 m; the other less often, at 4-90 m.
+STEADY_PHONE = [
     (916, 35180, 17), (1818, 34910, 9), (2042, 34680, 10), (2343, 33410, 10),
     (2644, 31830, 10), (2757, 31420, 10), (2944, 30980, 10), (3244, 30080, 10),
     (3415, 29530, 10), (3545, 29440, 10), (3845, 28730, 10), (4146, 28180, 10),
@@ -47,7 +48,7 @@ IOANNIS = [
     (9683, 2010, 10), (9692, 1980, 10), (9876, 1060, 10), (9923, 990, 10),
     (9984, 850, 10), (10226, 300, 10, True),
 ]  # fmt: skip
-NANCY = [
+PATCHY_PHONE = [
     (2098, 34600, 90), (2398, 33320, 40), (2709, 31680, 11), (2756, 31420, 40),
     (3012, 30940, 14), (3332, 29650, 40), (3638, 29260, 73), (3945, 28730, 37),
     (4267, 28130, 14), (4590, 27100, 23), (5184, 26590, 40), (5484, 25840, 22),
@@ -117,7 +118,7 @@ def drive(reports: list[tuple[int, ...]]) -> Drive:
     raise AssertionError("the replay never got home")
 
 
-PHONES = {"ioannis": IOANNIS, "nancy": NANCY}
+PHONES = {"steady": STEADY_PHONE, "patchy": PATCHY_PHONE}
 
 
 @pytest.mark.parametrize("phone", PHONES)
@@ -153,7 +154,7 @@ def test_the_zone_crossing_after_the_queues_is_believed_at_once(phone: str) -> N
 
 def test_no_change_between_reports_is_over_half_an_hour() -> None:
     """On the phone reporting every few minutes (before 2.4.0: +51, then -62)."""
-    estimates = drive(IOANNIS).estimates
+    estimates = drive(STEADY_PHONE).estimates
     for a, b in pairwise(estimates):
         if abs(b.arrival - a.arrival) > 30 * MIN:
             pytest.fail(f"{(b.arrival - a.arrival) / MIN:+.0f} min at {b.t - T0:.0f} s")
