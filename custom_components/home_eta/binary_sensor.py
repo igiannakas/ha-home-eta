@@ -1,8 +1,9 @@
 """Binary sensors for Home ETA.
 
 Per person: close to home (home or within 800 m) and nearby (home or within
-their near-home radius). Per group: someone arriving soon, someone close to
-home and someone nearby.
+their near-home radius). Per group: someone home, someone arriving soon,
+someone close to home and someone nearby, leaving out the members the group
+ignores.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -18,6 +20,7 @@ from .const import (
     KEY_CLOSE_TO_HOME,
     KEY_NEARBY,
     KEY_SOMEONE_CLOSE,
+    KEY_SOMEONE_HOME,
     KEY_SOMEONE_NEARBY,
     KEY_SOMEONE_SOON,
 )
@@ -39,6 +42,7 @@ async def async_setup_entry(
         return
     async_add_entities(
         [
+            SomeoneHomeSensor(runtime),
             SomeoneArrivingSoonSensor(runtime),
             SomeoneCloseSensor(runtime),
             SomeoneNearbySensor(runtime),
@@ -109,6 +113,36 @@ def _distance(runtime: PersonRuntime) -> int | None:
     return round(snap.distance_m)
 
 
+class SomeoneHomeSensor(GroupEntity, BinarySensorEntity):
+    """On while any member the group does not ignore is home.
+
+    Off when everyone counted is out, and when every member is ignored.
+    Unknown while it cannot be ruled out: nobody counted is home and one of
+    them has no data (being reloaded, say), as for the group's status.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.PRESENCE
+
+    def __init__(self, runtime: GroupRuntime) -> None:
+        """Initialise."""
+        super().__init__(runtime, KEY_SOMEONE_HOME)
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True when anyone counted is home, None when unsure."""
+        return self._runtime.view.someone_home
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return who is home, and who is ignored."""
+        view = self._runtime.view
+        return {
+            "persons": list(view.persons_home),
+            "names": list(view.home_names),
+            **self.ignored_attributes(),
+        }
+
+
 class SomeoneArrivingSoonSensor(GroupEntity, BinarySensorEntity):
     """On while any member is arriving soon by their own threshold.
 
@@ -131,6 +165,7 @@ class SomeoneArrivingSoonSensor(GroupEntity, BinarySensorEntity):
         return {
             "persons": list(view.arriving_soon),
             "names": list(view.arriving_soon_names),
+            **self.ignored_attributes(),
         }
 
 
@@ -154,7 +189,11 @@ class SomeoneCloseSensor(GroupEntity, BinarySensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return who is close to home."""
         view = self._runtime.view
-        return {"persons": list(view.close), "names": list(view.close_names)}
+        return {
+            "persons": list(view.close),
+            "names": list(view.close_names),
+            **self.ignored_attributes(),
+        }
 
 
 class SomeoneNearbySensor(GroupEntity, BinarySensorEntity):
@@ -176,4 +215,8 @@ class SomeoneNearbySensor(GroupEntity, BinarySensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return who is nearby."""
         view = self._runtime.view
-        return {"persons": list(view.nearby), "names": list(view.nearby_names)}
+        return {
+            "persons": list(view.nearby),
+            "names": list(view.nearby_names),
+            **self.ignored_attributes(),
+        }

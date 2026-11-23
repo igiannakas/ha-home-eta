@@ -2,7 +2,7 @@
 
 A Home Assistant integration that says who is heading home, when they will get there and how near home they are, from the Companion app's phone location. It works whether you walk, take the train or drive, needs no map or routing service, and never reads step counters. It was built to warm the house on the way home.
 
-Each person is added on their own, with their own entities and their own "arriving soon" threshold. A separate **group** entry combines people heading to the same zone: who is expected first, whether anyone is arriving soon, whether anyone is close to home or nearby, and how near the nearest is.
+Each person is added on their own, with their own entities and their own "arriving soon" threshold. A separate **group** entry combines people heading to the same zone: who is expected first, whether anyone is home, arriving soon, close to home or nearby, and how near the nearest is. A group can be told to ignore a member whose phone has stopped reporting.
 
 ## What you get
 
@@ -26,12 +26,16 @@ For a group (named "Home ETA" by default):
 | Entity | What it shows |
 | --- | --- |
 | `sensor.home_eta_status` | The most-home status of any member: `home` while anyone is home, else `arriving_soon` if anyone is, and so on. Unknown while nobody is home and a member has no data (being reloaded, say), since they could change the answer. Attributes list the members in each status (`persons_home`, `persons_arriving_soon`, `persons_heading_home`, `persons_away`) and any member without data. |
+| `binary_sensor.home_eta_someone_home` | On while any member is home. Its `persons` and `names` attributes say who; unknown while nobody is and a member has no data. |
 | `sensor.home_eta_expected_home` | When the first member heading home is expected; unknown while nobody is. Attributes: who that is, everyone heading home with their expected time, who is home, and any member without data. |
 | `sensor.home_eta_minutes_to_home` | Minutes until then. |
 | `binary_sensor.home_eta_someone_arriving_soon` | On while any member is arriving soon by their own threshold. Its `persons` and `names` attributes say who; unknown while nobody is and a member has no data. |
 | `binary_sensor.home_eta_someone_close_to_home` | On while any member is home or within 800 m. Its `persons` and `names` attributes say who; unknown while nobody is and a member has no data or no known distance yet. |
 | `binary_sensor.home_eta_someone_nearby` | On while any member is home or within their own near-home radius. Attributes and unknown as for someone close to home. |
 | `sensor.home_eta_near_home` | The highest near home of any member, each by their own radius (so not always the nearest member); 100 % while anyone is home. Attributes: who that is and their distance, and who is home. |
+| `switch.home_eta_ignore_person` | One per member: on while the group ignores them (see Ignoring a member whose phone is not reporting). |
+
+Every group sensor also has `ignored` and `ignored_names` attributes: the members the group ignores.
 
 All but the threshold and the typical speeds are unknown until the person's first location arrives. The group's sensors are unknown rather than off while a member could change the answer, so an automation that must not act on a guess can wait for on or off.
 
@@ -107,6 +111,19 @@ iPhones report crossing a zone's edge within seconds, but otherwise send a posit
 
 Add one in between where you often stay: a place at 28 km sits inside the 32 km ring, so a 24 km ring is the first one crossed on the way back from there. Passive zones never become a person's state, so automations that count people in Home, or check for `not_home`, are unaffected; their own state counts the people inside them, those at home included. The Companion app watches passive zones too (open it once after adding zones so it picks them up). An iPhone watches at most 20 zones; zones smaller than 100 m use three each. Any zone that wholly contains home counts as a ring; zones that do not are left alone.
 
+### Ignoring a member whose phone is not reporting
+
+A phone that dies at home leaves its person at home for good, so the group's someone home, close to home and nearby stay on and the house never looks empty. A group can be told to ignore such a member:
+
+- **What it does**: an ignored member is left out of everything the group shows: its status, expected home, near home, someone home, arriving soon, close to home and nearby. They do not count as missing either, so they never make a group sensor unknown. With every member out or ignored, the status is `away`, the binary sensors are off and near home is 0 %. The member's own entities are unchanged: they still show where the phone last said.
+- **Switches**: `switch.home_eta_ignore_person` for each member, on the group's device. Turn it on to ignore them, off to count them again. Its attributes say since when, why (`by_hand`, `away_pressed` or `stale`, as given) and the member's own status.
+- **Actions**: `home_eta.ignore_members_at_home` ignores everyone the group shows at home, or the `members` given, with an optional `reason`; `home_eta.stop_ignoring` counts everyone again, or the `members` given. Both take the group as `config_entry_id`, which can be left out when there is only one group, and return who changed (`persons`, `names`) and who is ignored now (`ignored`, `ignored_names`). With nobody at home there is nothing to do.
+- **It ends by itself** when someone the group counts arrives home (everyone is counted again: someone whose phone works is in), or when an ignored member's own phone reports again (that member only, wherever they are: out, or really at home). A report is a new state, position or GPS accuracy of the person while Home Assistant runs; states restored while it starts, a person coming back from unknown or unavailable, a restart, a reload, the minute's tick and a renamed person are not. There is no time limit.
+- **Kept** across restarts and reloads, in Home Assistant's storage. Taking a member out of the group stops ignoring them.
+- **Event**: every change fires `home_eta_ignored_changed`, with who is ignored now (`ignored`, `ignored_names`), who was added or removed (`added`, `added_names`, `removed`, `removed_names`), the `reason` for those added, and the `cause`: `action`, `switch`, `arrival` or `own_report`, with `cause_person` and `cause_name` for the last two. It is also logged.
+
+Who is shown at home is whoever the group shows at that moment: someone who arrived a moment before the action is ignored too, until their own phone next reports. Name the `members` when you know them.
+
 ### What it cannot do
 
 The Companion app does not send the time a position was measured, so reports are timed when Home Assistant receives them; a burst of queued reports after losing signal is mostly discarded as implausible jumps. A route that first heads away from home reads as moving away until it turns. A trip home that is shorter than the phone's reporting interval may get no warning at all: the first report is the arrival. Someone walking slower than about 2 km/h with an iPhone can go more than 15 minutes between reports, so their speed is not measured; raise **Speed stale after** in Advanced for them.
@@ -142,6 +159,10 @@ Renaming a person or a zone is followed automatically. Removing a person takes t
 On iPhones, make sure the Companion app has location set to **Always** with background refresh on.
 
 ## Upgrading
+
+### From 2.4
+
+- **Ignoring a member**: a group gains `binary_sensor.home_eta_someone_home`, a switch per member to ignore them, the `home_eta.ignore_members_at_home` and `home_eta.stop_ignoring` actions and the `home_eta_ignored_changed` event (see Ignoring a member whose phone is not reporting). Every group sensor gains `ignored` and `ignored_names` attributes. Nothing changes until a member is ignored. Nothing to set up.
 
 ### From 2.3
 
@@ -244,6 +265,27 @@ actions:
         {{ 20 if is_state('binary_sensor.home_eta_someone_close_to_home', 'on')
            else 19 if is_state('binary_sensor.home_eta_someone_nearby', 'on')
            else 16 }}
+```
+
+Say who is no longer ignored, and why:
+
+```yaml
+triggers:
+  - trigger: event
+    event_type: home_eta_ignored_changed
+conditions:
+  - condition: template
+    value_template: "{{ trigger.event.data.removed | length > 0 }}"
+actions:
+  - action: notify.mobile_app_iphone
+    data:
+      message: >
+        Counting {{ trigger.event.data.removed_names | join(' and ') }} again:
+        {{ trigger.event.data.cause_name ~ ' arrived home'
+           if trigger.event.data.cause == 'arrival'
+           else 'their phone reported again'
+           if trigger.event.data.cause == 'own_report'
+           else 'by hand' }}.
 ```
 
 Announce who is nearly home, each person by their own threshold:

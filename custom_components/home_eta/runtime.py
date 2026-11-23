@@ -6,14 +6,15 @@ typical speeds from their trips home (``core/calibration.py``): each trip as
 it completes, and the recorder's history once, when first set up. They are
 kept in Home Assistant's storage (distances, speeds and arrival times; no
 coordinates). ``GroupRuntime`` watches the person runtimes for one zone and
-combines them.
+combines them, leaving out the members it has been told to ignore (a phone
+that went silent at home would otherwise keep the house "occupied" for good).
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from homeassistant.components.zone import async_get_enclosing_zones
 from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
+    ATTR_GPS_ACCURACY,
     ATTR_LATITUDE,
     ATTR_LONGITUDE,
     STATE_UNAVAILABLE,
@@ -61,6 +63,7 @@ from homeassistant.util.hass_dict import HassKey
 from .const import (
     ADVANCED_PARAMS,
     CONF_ADVANCED,
+    CONF_ENTRY_TYPE,
     CONF_MEMBERS,
     CONF_NEAR_HOME_RADIUS_M,
     CONF_PERSON,
@@ -68,8 +71,11 @@ from .const import (
     DEFAULT_NEAR_HOME_RADIUS_M,
     DIAGNOSTICS_COORDINATE_DECIMALS,
     DOMAIN,
+    ENTRY_TYPE_PERSON,
+    EVENT_IGNORED_CHANGED,
     FIX_LOG_SIZE,
     HISTORY_LOOKBACK,
+    IGNORED_STORE_VERSION,
     NEAR_HOME_FULL_M,
     NEAR_HOME_OFF_MARGIN_M,
     RELEARN_KEEP_S,
@@ -78,6 +84,8 @@ from .const import (
     SPEEDS_SAVE_DELAY_S,
     SPEEDS_STORE_VERSION,
     TICK_INTERVAL,
+    IgnoreCause,
+    IgnoreReason,
 )
 from .core.calibration import LearnedTrip, SpeedCalibrator
 from .core.homeward import HomewardRestore, NearHomeConfig
@@ -103,6 +111,9 @@ _LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 ATTR_RADIUS = "radius"
+
+REPORT_ATTRIBUTES = (ATTR_LATITUDE, ATTR_LONGITUDE, ATTR_GPS_ACCURACY)
+"""What a person's tracker reports besides the state: a change is a report."""
 
 
 @dataclass(slots=True)
@@ -140,6 +151,34 @@ def speeds_store(hass: HomeAssistant, entry_id: str) -> Store[dict[str, Any]]:
     )
 
 
+def ignored_store(hass: HomeAssistant, entry_id: str) -> Store[dict[str, Any]]:
+    """Return the store of the members a group ignores."""
+    return Store(hass, IGNORED_STORE_VERSION, f"{DOMAIN}.ignored.{entry_id}")
+
+
+def is_new_report(old: State | None, new: State | None) -> bool:
+    """Return True when a person's state change carries a new report.
+
+    That is a new state, or a new position or accuracy, from one usable state
+    to another. A person (or their tracker) appearing, disappearing or coming
+    back from unknown or unavailable is not one: that is what loading and
+    restoring look like. Neither is a change of other attributes (the
+    person's name or trackers, edited by hand). Whether Home Assistant is
+    running is for the caller to check: states restored while it starts
+    change like reports.
+    """
+    if old is None or new is None:
+        return False
+    unusable = (STATE_UNKNOWN, STATE_UNAVAILABLE)
+    if old.state in unusable or new.state in unusable:
+        return False
+    if old.state != new.state:
+        return True
+    return any(
+        old.attributes.get(key) != new.attributes.get(key) for key in REPORT_ATTRIBUTES
+    )
+
+
 def target_from_state(state: State | None) -> Target | None:
     """Return the target described by a zone state, if usable."""
     if state is None or state.state == STATE_UNAVAILABLE:
@@ -173,6 +212,11 @@ class PersonView:
     available: bool
     snapshot: TrackerSnapshot | None
     """None until the person's whereabouts are first known."""
+    last_report: float | None = None
+    """When the person's tracker last reported while Home Assistant ran (since
+    this entry was loaded): see :func:`is_new_report`. A group reads it to
+    tell a member's own report from a restart, a reload or a minute's tick.
+    """
 
     @property
     def expected_home(self) -> datetime | None:
@@ -230,6 +274,7 @@ class PersonRuntime:
         self._person_present: bool | None = None
         self._has_report = False
         """A usable report of the person has arrived (until then: no data)."""
+        self._last_report: float | None = None
         self._fix_log: deque[FixLogEntry] = deque(maxlen=FIX_LOG_SIZE)
         self.view = PersonView(False, None)
         self._speeds = SpeedCalibrator(params=self.config.params)
@@ -424,6 +469,12 @@ class PersonRuntime:
                 report, use_for_kinematics=self._kinematics_enabled
             )
             self._has_report = True
+            if (
+                self._kinematics_enabled
+                and self.hass.state is CoreState.running
+                and is_new_report(event.data["old_state"], new_state)
+            ):
+                self._last_report = report.timestamp
             self._log_fix(new_state, report, outcome)
             self._learn(self.tracker.take_completed_trips())
         self._refresh()
@@ -829,6 +880,7 @@ class PersonRuntime:
         self.view = PersonView(
             available=bool(self._person_present),
             snapshot=snapshot,
+            last_report=self._last_report,
         )
         for update in list(self._listeners):
             update()
@@ -859,6 +911,9 @@ class PersonRuntime:
             "kinematics_enabled": self._kinematics_enabled,
             "person_present": self._person_present,
             "has_report": self._has_report,
+            "last_report": None
+            if self._last_report is None
+            else dt_util.utc_from_timestamp(self._last_report).isoformat(),
             "params": {
                 key: getattr(self.config.params, key) for key in ADVANCED_PARAMS
             },
@@ -922,13 +977,49 @@ class NearHome:
 
 
 @dataclass(frozen=True, slots=True)
+class IgnoredMember:
+    """A member the group leaves out, and why."""
+
+    reason: IgnoreReason
+    since: float
+    """When they were first ignored (a timestamp)."""
+
+
+@dataclass(frozen=True, slots=True)
+class IgnoredChange:
+    """One change of a group's ignored members."""
+
+    added: tuple[str, ...]
+    removed: tuple[str, ...]
+    cause: IgnoreCause
+    cause_person: str | None = None
+    """Who arrived, or whose own phone reported (for those two causes)."""
+    reason: IgnoreReason | None = None
+    """Why those added are ignored."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Seen:
+    """A member's last report and status, as the group last saw them."""
+
+    report: float | None
+    status: PersonStatus
+
+
+@dataclass(frozen=True, slots=True)
 class GroupView:
-    """What a group's entities publish."""
+    """What a group's entities publish.
+
+    Ignored members are in none of the lists but :attr:`ignored`: they count
+    neither as anywhere nor as missing.
+    """
 
     heading_home: tuple[HeadingHome, ...] = ()
     """Members heading home, the one expected first leading."""
     by_status: Mapping[PersonStatus, tuple[str, ...]] = field(default_factory=dict)
     """Members with data, by status."""
+    home_names: tuple[str, ...] = ()
+    """The names of the members at home."""
     arriving_soon_names: tuple[str, ...] = ()
     missing: tuple[str, ...] = ()
     near: NearHome | None = None
@@ -941,6 +1032,9 @@ class GroupView:
     nearby_names: tuple[str, ...] = ()
     unplaced: tuple[str, ...] = ()
     """Members with data whose distance is not known yet."""
+    ignored: tuple[str, ...] = ()
+    """Members left out of everything else."""
+    ignored_names: tuple[str, ...] = ()
 
     @property
     def first(self) -> HeadingHome | None:
@@ -958,18 +1052,37 @@ class GroupView:
         return self.by_status.get(PersonStatus.ARRIVING_SOON, ())
 
     @property
+    def everyone_ignored(self) -> bool:
+        """Return True when the group has members and ignores all of them."""
+        return bool(self.ignored) and not self.by_status and not self.missing
+
+    @property
     def status(self) -> PersonStatus | None:
         """Return the most-home status of any member.
 
         Home while anyone is home. Otherwise None while any member has no
         data (being reloaded, say): they might be the one nearest home, and a
-        status that is wrong for a moment would trigger automations.
+        status that is wrong for a moment would trigger automations. Away
+        when every member is ignored; None with no members at all.
         """
         if self.persons_home:
             return PersonStatus.HOME
+        if self.everyone_ignored:
+            return PersonStatus.AWAY
         if self.missing or not self.by_status:
             return None
         return next(status for status in STATUS_ORDER if self.by_status.get(status))
+
+    @property
+    def someone_home(self) -> bool | None:
+        """Return True while any member is home.
+
+        None while that cannot be ruled out: a member has no data (as for the
+        status). False when every member is ignored.
+        """
+        if self.persons_home:
+            return True
+        return self._none_settled()
 
     @property
     def someone_arriving_soon(self) -> bool | None:
@@ -979,9 +1092,7 @@ class GroupView:
         """
         if self.arriving_soon:
             return True
-        if self.missing or not self.by_status:
-            return None
-        return False
+        return self._none_settled()
 
     @property
     def someone_close(self) -> bool | None:
@@ -1003,13 +1114,30 @@ class GroupView:
     def _anyone(self, members: tuple[str, ...]) -> bool | None:
         if members:
             return True
-        if self.missing or self.unplaced or not self.by_status:
+        if self.unplaced:
+            return None
+        return self._none_settled()
+
+    def _none_settled(self) -> bool | None:
+        """Return False when nobody counted can be the one, None when unsure."""
+        if self.everyone_ignored:
+            return False
+        if self.missing or not self.by_status:
+            # A member who could be the one, or no members at all.
             return None
         return False
 
 
 class GroupRuntime:
-    """Combine the members of a group heading to one zone."""
+    """Combine the members of a group heading to one zone.
+
+    The group also keeps the members it ignores (with why and since when, in
+    Home Assistant's storage), and stops ignoring them by itself: everyone
+    once a member it counts arrives home, and one member once their own
+    phone reports again. Both are judged only on reports made while Home
+    Assistant runs (see :func:`is_new_report`), never on a restart, a reload
+    or a tick.
+    """
 
     def __init__(self, hass: HomeAssistant, entry: HomeEtaConfigEntry) -> None:
         """Read the entry."""
@@ -1019,6 +1147,10 @@ class GroupRuntime:
         self.members: tuple[str, ...] = tuple(entry.options.get(CONF_MEMBERS) or ())
         self._listeners: list[CALLBACK_TYPE] = []
         self._unsubscribe: Callable[[], None] | None = None
+        self._ignored: dict[str, IgnoredMember] = {}
+        self._seen: dict[str, _Seen] = {}
+        self._store = ignored_store(hass, entry.entry_id)
+        self._saves: set[asyncio.Task[None]] = set()
         self.view = GroupView()
 
     @property
@@ -1031,8 +1163,13 @@ class GroupRuntime:
             model="Group",
         )
 
+    @property
+    def ignored(self) -> Mapping[str, IgnoredMember]:
+        """Return the members ignored, and why."""
+        return dict(self._ignored)
+
     async def async_start(self) -> None:
-        """Subscribe to member updates."""
+        """Take back the members ignored, then subscribe to member updates."""
         issue_id = f"group_no_members_{self.entry.entry_id}"
         if self.members:
             ir.async_delete_issue(self.hass, DOMAIN, issue_id)
@@ -1047,16 +1184,20 @@ class GroupRuntime:
                 translation_key="group_no_members",
                 translation_placeholders={"entry": self.entry.title},
             )
+        # Before the first refresh: no entity may show an ignored member home.
+        await self._async_load_ignored()
         self._unsubscribe = async_dispatcher_connect(
             self.hass, SIGNAL_PERSON_UPDATED.format(zone=self.zone_id), self._refresh
         )
         self._refresh()
 
     async def async_stop(self) -> None:
-        """Unsubscribe."""
+        """Unsubscribe, and finish saving the members ignored."""
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
+        # A reload loads what this run saved last.
+        await asyncio.gather(*self._saves)
 
     @callback
     def async_add_listener(self, update: CALLBACK_TYPE) -> CALLBACK_TYPE:
@@ -1069,11 +1210,198 @@ class GroupRuntime:
 
         return remove
 
+    # -- ignored members -------------------------------------------------
+
+    def member_name(self, person_id: str) -> str:
+        """Return a member's name: their person entry's title, as elsewhere."""
+        runtime = self.hass.data[DATA_KEY].persons.get((person_id, self.zone_id))
+        if runtime is not None:
+            return runtime.entry.title
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            if (
+                entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_PERSON
+                and entry.data.get(CONF_PERSON) == person_id
+                and entry.data.get(CONF_ZONE) == self.zone_id
+            ):
+                return entry.title
+        return friendly_name(self.hass, person_id)
+
+    def member_status(self, person_id: str) -> PersonStatus | None:
+        """Return a member's own status, ignored or not; None without data."""
+        runtime = self.hass.data[DATA_KEY].persons.get((person_id, self.zone_id))
+        if runtime is None or not runtime.view.available:
+            return None
+        snapshot = runtime.view.snapshot
+        return None if snapshot is None else snapshot.status
+
     @callback
-    def _refresh(self) -> None:
+    def ignore(
+        self,
+        persons: Iterable[str] | None,
+        reason: IgnoreReason,
+        cause: IgnoreCause,
+    ) -> tuple[str, ...]:
+        """Ignore ``persons``, or every member shown at home; return who is new.
+
+        Members already ignored keep their reason and since when.
+        """
+        wanted = set(self.view.persons_home if persons is None else persons)
+        if unknown := wanted.difference(self.members):
+            raise ValueError(f"not members of {self.entry.title}: {sorted(unknown)}")
+        added = tuple(
+            person
+            for person in self.members
+            if person in wanted and person not in self._ignored
+        )
+        if added:
+            since = dt_util.utcnow().timestamp()
+            for person in added:
+                self._ignored[person] = IgnoredMember(reason, since)
+            self._refresh([IgnoredChange(added, (), cause, reason=reason)])
+        return added
+
+    @callback
+    def stop_ignoring(
+        self, persons: Iterable[str] | None, cause: IgnoreCause
+    ) -> tuple[str, ...]:
+        """Stop ignoring ``persons``, or everyone; return who was ignored."""
+        wanted = set(self._ignored if persons is None else persons)
+        if unknown := wanted.difference(self.members):
+            raise ValueError(f"not members of {self.entry.title}: {sorted(unknown)}")
+        removed = tuple(
+            person
+            for person in self.members
+            if person in wanted and person in self._ignored
+        )
+        if removed:
+            for person in removed:
+                del self._ignored[person]
+            self._refresh([IgnoredChange((), removed, cause)])
+        return removed
+
+    async def _async_load_ignored(self) -> None:
+        """Take back the members ignored before a restart or reload."""
+        try:
+            saved = await self._store.async_load()
+        except UnsupportedStorageVersionError:
+            _LOGGER.warning(
+                "%s: the members ignored were saved by a newer version of Home "
+                "ETA; none are ignored",
+                self.entry.title,
+            )
+            saved = None
+        stored = (saved or {}).get("members")
+        dropped: list[str] = []
+        for person, item in (stored if isinstance(stored, dict) else {}).items():
+            if person not in self.members:
+                dropped.append(person)
+                continue
+            try:
+                reason = IgnoreReason(item["reason"])
+                since = dt_util.parse_datetime(item["since"])
+            except KeyError, TypeError, ValueError:
+                since = None
+            if since is None:
+                _LOGGER.warning(
+                    "%s: could not read whether %s is ignored; they are not",
+                    self.entry.title,
+                    person,
+                )
+                dropped.append(person)
+                continue
+            self._ignored[person] = IgnoredMember(reason, since.timestamp())
+        if self._ignored:
+            _LOGGER.info(
+                "%s: still ignoring %s",
+                self.entry.title,
+                _join(self.member_name(person) for person in self._ignored),
+            )
+        if dropped:
+            # Taken out of the group, or unreadable: gone from storage too.
+            self._save()
+
+    @callback
+    def _save(self) -> None:
+        data = {
+            "members": {
+                person: {
+                    "reason": item.reason.value,
+                    "since": dt_util.utc_from_timestamp(item.since).isoformat(),
+                }
+                for person, item in self._ignored.items()
+            }
+        }
+        save = self.entry.async_create_task(
+            self.hass,
+            self._async_save(data),
+            f"{DOMAIN} save ignored members {self.entry.entry_id}",
+        )
+        self._saves.add(save)
+        save.add_done_callback(self._saves.discard)
+
+    async def _async_save(self, data: dict[str, Any]) -> None:
+        """Write the members ignored; a failure is logged (they stay ignored)."""
+        try:
+            await self._store.async_save(data)
+        except HomeAssistantError, OSError:
+            _LOGGER.exception(
+                "%s: could not save the members ignored, so a restart would "
+                "forget the latest change",
+                self.entry.title,
+            )
+
+    @callback
+    def _apply_clearing_rules(self) -> list[IgnoredChange]:
+        """Stop ignoring members on a report made since the last refresh.
+
+        Each member's last report and status are noted at every refresh;
+        what follows looks only at members whose report is new since then.
+        A member counted who goes from not home to home: everyone (an
+        arrival whose phone works says the house is not empty). Otherwise
+        an ignored member's own report: that member, wherever they are.
+        Nothing is noted while a member has no data, so a member reloading
+        resumes from where they were, with a report time of none.
+        """
+        persons = self.hass.data[DATA_KEY].persons
+        arrived: list[str] = []
+        reported: list[str] = []
+        for person in self.members:
+            runtime = persons.get((person, self.zone_id))
+            if runtime is None or not runtime.view.available:
+                continue
+            view = runtime.view
+            if view.snapshot is None:
+                continue
+            status = view.snapshot.status
+            seen = self._seen.get(person)
+            self._seen[person] = _Seen(view.last_report, status)
+            if seen is None or view.last_report in (None, seen.report):
+                continue
+            if person in self._ignored:
+                reported.append(person)
+            elif status is PersonStatus.HOME and seen.status is not PersonStatus.HOME:
+                arrived.append(person)
+        if not self._ignored or self.hass.state is not CoreState.running:
+            return []
+        if arrived:
+            removed = tuple(
+                person for person in self.members if person in self._ignored
+            )
+            self._ignored.clear()
+            return [IgnoredChange((), removed, IgnoreCause.ARRIVAL, arrived[0])]
+        changes: list[IgnoredChange] = []
+        for person in reported:
+            del self._ignored[person]
+            changes.append(IgnoredChange((), (person,), IgnoreCause.OWN_REPORT, person))
+        return changes
+
+    @callback
+    def _refresh(self, changes: Sequence[IgnoredChange] = ()) -> None:
+        changes = [*changes, *self._apply_clearing_rules()]
         persons = self.hass.data[DATA_KEY].persons
         heading: list[HeadingHome] = []
         by_status: dict[PersonStatus, list[str]] = {}
+        home_names: list[str] = []
         soon_names: list[str] = []
         missing: list[str] = []
         near: NearHome | None = None
@@ -1081,6 +1409,8 @@ class GroupRuntime:
         nearby: list[tuple[str, str]] = []
         unplaced: list[str] = []
         for person_id in self.members:
+            if person_id in self._ignored:
+                continue
             runtime = persons.get((person_id, self.zone_id))
             if runtime is None or not runtime.view.available:
                 missing.append(person_id)
@@ -1093,6 +1423,8 @@ class GroupRuntime:
             name = runtime.entry.title
             status = snapshot.status
             by_status.setdefault(status, []).append(person_id)
+            if status is PersonStatus.HOME:
+                home_names.append(name)
             expected, minutes = view.expected_home, view.minutes_to_home
             if expected is not None and minutes is not None:
                 heading.append(HeadingHome(person_id, name, expected, minutes))
@@ -1114,9 +1446,11 @@ class GroupRuntime:
             if snapshot.nearby:
                 nearby.append((person_id, name))
         heading.sort(key=lambda member: (member.arrival, member.person_id))
+        ignored = tuple(person for person in self.members if person in self._ignored)
         self.view = GroupView(
             heading_home=tuple(heading),
             by_status={status: tuple(ids) for status, ids in by_status.items()},
+            home_names=tuple(home_names),
             arriving_soon_names=tuple(soon_names),
             missing=tuple(missing),
             near=near,
@@ -1125,9 +1459,63 @@ class GroupRuntime:
             nearby=tuple(person for person, _ in nearby),
             nearby_names=tuple(name for _, name in nearby),
             unplaced=tuple(unplaced),
+            ignored=ignored,
+            ignored_names=tuple(self.member_name(person) for person in ignored),
         )
         for update in list(self._listeners):
             update()
+        if changes:
+            self._save()
+        for change in changes:
+            self._announce(change)
+
+    @callback
+    def _announce(self, change: IgnoredChange) -> None:
+        """Log a change of the members ignored, and fire its event."""
+        title = self.entry.title
+        names = self.member_name
+        if change.added:
+            _LOGGER.info(
+                "%s: ignoring %s (%s, by the %s)",
+                title,
+                _join(names(person) for person in change.added),
+                change.reason,
+                "ignore action" if change.cause is IgnoreCause.ACTION else "switch",
+            )
+        else:
+            match change.cause:
+                case IgnoreCause.ARRIVAL:
+                    why = f"{_name_of(names, change.cause_person)} arrived home"
+                case IgnoreCause.OWN_REPORT:
+                    why = "their own phone reported again"
+                case IgnoreCause.ACTION:
+                    why = "by hand, with the stop ignoring action"
+                case IgnoreCause.SWITCH:
+                    why = "by hand, with the switch"
+            _LOGGER.info(
+                "%s: no longer ignoring %s: %s",
+                title,
+                _join(names(person) for person in change.removed),
+                why,
+            )
+        view = self.view
+        self.hass.bus.async_fire(
+            EVENT_IGNORED_CHANGED,
+            {
+                "entry_id": self.entry.entry_id,
+                "group": title,
+                "ignored": list(view.ignored),
+                "ignored_names": list(view.ignored_names),
+                "added": list(change.added),
+                "added_names": [names(person) for person in change.added],
+                "removed": list(change.removed),
+                "removed_names": [names(person) for person in change.removed],
+                "reason": None if change.reason is None else change.reason.value,
+                "cause": change.cause.value,
+                "cause_person": change.cause_person,
+                "cause_name": _name_of(names, change.cause_person),
+            },
+        )
 
     def diagnostics(self) -> dict[str, Any]:
         """Return the group's state."""
@@ -1135,6 +1523,13 @@ class GroupRuntime:
         return {
             "zone": self.zone_id,
             "members": list(self.members),
+            "ignored": {
+                person: {
+                    "reason": item.reason.value,
+                    "since": dt_util.utc_from_timestamp(item.since).isoformat(),
+                }
+                for person, item in self._ignored.items()
+            },
             "heading_home": [
                 {
                     "person": member.person_id,
@@ -1161,6 +1556,18 @@ class GroupRuntime:
                 "distance_m": round(view.near.distance_m),
             },
         }
+
+
+def _join(names: Iterable[str]) -> str:
+    """Return names as "A", "A and B" or "A, B and C"."""
+    items = list(names)
+    if len(items) < 2:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _name_of(name: Callable[[str], str], person: str | None) -> str | None:
+    return None if person is None else name(person)
 
 
 def _round(value: float | None, decimals: int) -> float | None:

@@ -2,7 +2,9 @@
 
 Each person is its own config entry with its own entities. A separate group
 entry combines people heading to the same zone: the first expected, whether
-anyone is arriving soon, close to home or nearby, and how near the nearest is.
+anyone is home, arriving soon, close to home or nearby, and how near the
+nearest is. A group can be told to ignore members (a phone that went silent at
+home, say), by a switch per member or by its actions.
 """
 
 from __future__ import annotations
@@ -30,7 +32,15 @@ from .const import (
     ENTRY_TYPE_PERSON,
 )
 from .migration import async_migrate_entry, async_remove_retired, legacy_store
-from .runtime import DATA_KEY, GroupRuntime, HomeEtaData, PersonRuntime, speeds_store
+from .runtime import (
+    DATA_KEY,
+    GroupRuntime,
+    HomeEtaData,
+    PersonRuntime,
+    ignored_store,
+    speeds_store,
+)
+from .services import async_setup_services
 
 __all__ = ["async_migrate_entry"]
 
@@ -46,14 +56,15 @@ PERSON_PLATFORMS = [
     Platform.NUMBER,
     Platform.SENSOR,
 ]
-GROUP_PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+GROUP_PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR, Platform.SWITCH]
 
 ISSUES = ("person_missing", "zone_missing", "group_no_members")
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the registry of loaded people."""
+    """Set up the registry of loaded people, and the actions."""
     hass.data[DATA_KEY] = HomeEtaData()
+    async_setup_services(hass)
     return True
 
 
@@ -94,6 +105,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     for issue in ISSUES:
         ir.async_delete_issue(hass, DOMAIN, f"{issue}_{entry.entry_id}")
     if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_GROUP:
+        await ignored_store(hass, entry.entry_id).async_remove()
         return
     person, zone = entry.data[CONF_PERSON], entry.data[CONF_ZONE]
     for group in hass.config_entries.async_entries(DOMAIN):

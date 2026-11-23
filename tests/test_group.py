@@ -25,8 +25,18 @@ NEAR = "sensor.home_eta_near_home"
 SOMEONE_SOON = "binary_sensor.home_eta_someone_arriving_soon"
 SOMEONE_CLOSE = "binary_sensor.home_eta_someone_close_to_home"
 SOMEONE_NEARBY = "binary_sensor.home_eta_someone_nearby"
+SOMEONE_HOME = "binary_sensor.home_eta_someone_home"
 STATUS = "sensor.home_eta_status"
-ALL = (STATUS, EXPECTED, MINUTES, NEAR, SOMEONE_SOON, SOMEONE_CLOSE, SOMEONE_NEARBY)
+ALL = (
+    STATUS,
+    EXPECTED,
+    MINUTES,
+    NEAR,
+    SOMEONE_HOME,
+    SOMEONE_SOON,
+    SOMEONE_CLOSE,
+    SOMEONE_NEARBY,
+)
 
 pytestmark = pytest.mark.usefixtures("zones")
 
@@ -47,7 +57,9 @@ async def test_group_entities(hass: HomeAssistant) -> None:
     await setup_entries(hass, person_entry(ALEX), group)
     registry = er.async_get(hass)
     entries = er.async_entries_for_config_entry(registry, group.entry_id)
-    assert sorted(e.entity_id for e in entries) == sorted(ALL)
+    assert sorted(e.entity_id for e in entries) == sorted(
+        (*ALL, "switch.home_eta_ignore_alex")
+    )
     device = dr.async_get(hass).async_get(registry.async_get(EXPECTED).device_id)
     assert device is not None
     assert device.name == "Home ETA"

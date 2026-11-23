@@ -76,6 +76,12 @@
       "someone_arriving_soon": {
         "name": "Someone arriving soon",
         "state_attributes": {
+          "ignored": {
+            "name": "Ignored"
+          },
+          "ignored_names": {
+            "name": "Ignored names"
+          },
           "names": {
             "name": "Names"
           },
@@ -87,6 +93,29 @@
       "someone_close_to_home": {
         "name": "Someone close to home",
         "state_attributes": {
+          "ignored": {
+            "name": "Ignored"
+          },
+          "ignored_names": {
+            "name": "Ignored names"
+          },
+          "names": {
+            "name": "Names"
+          },
+          "persons": {
+            "name": "People"
+          }
+        }
+      },
+      "someone_home": {
+        "name": "Someone home",
+        "state_attributes": {
+          "ignored": {
+            "name": "Ignored"
+          },
+          "ignored_names": {
+            "name": "Ignored names"
+          },
           "names": {
             "name": "Names"
           },
@@ -98,6 +127,12 @@
       "someone_nearby": {
         "name": "Someone nearby",
         "state_attributes": {
+          "ignored": {
+            "name": "Ignored"
+          },
+          "ignored_names": {
+            "name": "Ignored names"
+          },
           "names": {
             "name": "Names"
           },
@@ -127,6 +162,12 @@
           "heading_home": {
             "name": "Heading home"
           },
+          "ignored": {
+            "name": "Ignored"
+          },
+          "ignored_names": {
+            "name": "Ignored names"
+          },
           "missing_members": {
             "name": "Missing members"
           },
@@ -142,13 +183,27 @@
         }
       },
       "minutes_to_home": {
-        "name": "Minutes to home"
+        "name": "Minutes to home",
+        "state_attributes": {
+          "ignored": {
+            "name": "Ignored"
+          },
+          "ignored_names": {
+            "name": "Ignored names"
+          }
+        }
       },
       "near_home": {
         "name": "Near home",
         "state_attributes": {
           "distance_m": {
             "name": "Distance"
+          },
+          "ignored": {
+            "name": "Ignored"
+          },
+          "ignored_names": {
+            "name": "Ignored names"
           },
           "person": {
             "name": "Person"
@@ -178,6 +233,12 @@
         "state_attributes": {
           "farthest_m": {
             "name": "Farthest since last stay"
+          },
+          "ignored": {
+            "name": "Ignored"
+          },
+          "ignored_names": {
+            "name": "Ignored names"
           },
           "missing_members": {
             "name": "Missing members"
@@ -255,11 +316,53 @@
           }
         }
       }
+    },
+    "switch": {
+      "ignore_member": {
+        "name": "Ignore {name}",
+        "state_attributes": {
+          "person": {
+            "name": "Person"
+          },
+          "reason": {
+            "name": "Reason",
+            "state": {
+              "away_pressed": "Away pressed while out",
+              "by_hand": "By hand",
+              "stale": "Phone not reporting"
+            }
+          },
+          "since": {
+            "name": "Since"
+          },
+          "status": {
+            "name": "Status",
+            "state": {
+              "arriving_soon": "Arriving soon",
+              "away": "Away",
+              "heading_home": "Heading home",
+              "home": "Home"
+            }
+          }
+        }
+      }
     }
   },
   "exceptions": {
+    "group_ambiguous": {
+      "message": "There are several Home ETA groups ({groups}): pick one."
+    },
     "invalid_options": {
       "message": "Invalid options: {error}"
+    },
+    "no_group": {
+      "message": "There is no Home ETA group loaded."
+    },
+    "not_a_group": {
+      "message": "\"{entry}\" is a person, not a Home ETA group: pick a group."
+    },
+    "not_members": {
+      "message": "Not members of the group \"{group}\": {persons}."
     },
     "relearn_interrupted": {
       "message": "Home ETA was reloaded or stopped while relearning typical speeds. Press Relearn again."
@@ -323,6 +426,49 @@
           }
         },
         "title": "Home ETA options"
+      }
+    }
+  },
+  "selector": {
+    "reason": {
+      "options": {
+        "away_pressed": "Away pressed while out",
+        "by_hand": "By hand",
+        "stale": "Phone not reporting"
+      }
+    }
+  },
+  "services": {
+    "ignore_members_at_home": {
+      "name": "Ignore members at home",
+      "description": "Leaves the members shown at home, or the members given, out of a group until someone it counts arrives home or their own phone reports again. For a phone that went silent at home.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Group",
+          "description": "The group. Can be left out when there is only one."
+        },
+        "members": {
+          "name": "Members",
+          "description": "Ignore these members, wherever they are shown. Leave out to ignore everyone shown at home."
+        },
+        "reason": {
+          "name": "Reason",
+          "description": "Why they are ignored, shown on their ignore switch."
+        }
+      }
+    },
+    "stop_ignoring": {
+      "name": "Stop ignoring",
+      "description": "Counts ignored members of a group again.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Group",
+          "description": "The group. Can be left out when there is only one."
+        },
+        "members": {
+          "name": "Members",
+          "description": "Count these members again. Leave out to count everyone again."
+        }
       }
     }
   }

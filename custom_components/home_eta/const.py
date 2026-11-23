@@ -7,6 +7,7 @@ holds the Home Assistant-facing names.
 from __future__ import annotations
 
 from datetime import timedelta
+from enum import StrEnum
 from typing import Final
 
 DOMAIN: Final = "home_eta"
@@ -64,6 +65,37 @@ written their last states yet."""
 SIGNAL_PERSON_UPDATED: Final = f"{DOMAIN}_person_updated_{{zone}}"
 """Dispatcher signal, formatted with the zone entity id."""
 
+# Members a group ignores (a phone that went silent at home, say)
+IGNORED_STORE_VERSION: Final = 1
+EVENT_IGNORED_CHANGED: Final = f"{DOMAIN}_ignored_changed"
+"""Fired on every change of a group's ignored members."""
+SERVICE_IGNORE_MEMBERS_AT_HOME: Final = "ignore_members_at_home"
+SERVICE_STOP_IGNORING: Final = "stop_ignoring"
+ATTR_MEMBERS: Final = "members"
+ATTR_REASON: Final = "reason"
+
+
+class IgnoreReason(StrEnum):
+    """Why a member is ignored: given by whoever ignores them."""
+
+    BY_HAND = "by_hand"
+    AWAY_PRESSED = "away_pressed"
+    STALE = "stale"
+
+
+class IgnoreCause(StrEnum):
+    """What changed a group's ignored members."""
+
+    ACTION = "action"
+    """``ignore_members_at_home`` or ``stop_ignoring``."""
+    SWITCH = "switch"
+    """A member's ignore switch, turned on or off."""
+    ARRIVAL = "arrival"
+    """A member who is not ignored arrived home: everyone is counted again."""
+    OWN_REPORT = "own_report"
+    """An ignored member's own phone reported again: they are counted again."""
+
+
 # Entity keys (also translation keys and unique-id suffixes)
 KEY_STATUS: Final = "status"
 KEY_THRESHOLD: Final = "arriving_soon_threshold"
@@ -76,5 +108,7 @@ KEY_CLOSE_TO_HOME: Final = "close_to_home"
 KEY_NEARBY: Final = "nearby"
 KEY_SOMEONE_CLOSE: Final = "someone_close_to_home"
 KEY_SOMEONE_NEARBY: Final = "someone_nearby"
+KEY_SOMEONE_HOME: Final = "someone_home"
+KEY_IGNORE_MEMBER: Final = "ignore_member"
 KEY_TYPICAL_SPEEDS: Final = "typical_speeds"
 KEY_RELEARN_SPEEDS: Final = "relearn_typical_speeds"

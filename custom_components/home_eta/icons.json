@@ -13,6 +13,10 @@
         "default": "mdi:home-outline",
         "state": { "on": "mdi:home-account" }
       },
+      "someone_home": {
+        "default": "mdi:home-outline",
+        "state": { "on": "mdi:home-account" }
+      },
       "someone_close_to_home": {
         "default": "mdi:home-off-outline",
         "state": { "on": "mdi:home-circle-outline" }
@@ -43,6 +47,16 @@
         }
       },
       "typical_speeds": { "default": "mdi:speedometer" }
+    },
+    "switch": {
+      "ignore_member": {
+        "default": "mdi:account-check-outline",
+        "state": { "on": "mdi:account-off-outline" }
+      }
     }
+  },
+  "services": {
+    "ignore_members_at_home": { "service": "mdi:account-off-outline" },
+    "stop_ignoring": { "service": "mdi:account-check-outline" }
   }
 }

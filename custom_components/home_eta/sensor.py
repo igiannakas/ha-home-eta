@@ -332,8 +332,9 @@ class TypicalSpeedsSensor(PersonEntity, SensorEntity):
 class GroupStatusSensor(GroupEntity, SensorEntity):
     """The most-home status of any member: home if anyone is, and so on.
 
-    Unknown while a member has no data and nobody is home. Its attributes
-    list who is where.
+    Unknown while a member has no data and nobody is home; away when every
+    member is ignored. Its attributes list who is where, ignored members
+    apart.
     """
 
     _attr_device_class = SensorDeviceClass.ENUM
@@ -358,6 +359,7 @@ class GroupStatusSensor(GroupEntity, SensorEntity):
             for status in STATUS_ORDER
         }
         attributes["missing_members"] = list(view.missing)
+        attributes.update(self.ignored_attributes())
         return attributes
 
 
@@ -396,6 +398,7 @@ class GroupExpectedHomeSensor(GroupEntity, SensorEntity):
             ],
             "persons_home": list(view.persons_home),
             "missing_members": list(view.missing),
+            **self.ignored_attributes(),
         }
 
 
@@ -416,9 +419,16 @@ class GroupMinutesSensor(GroupEntity, SensorEntity):
         first = self._runtime.view.first
         return None if first is None else first.minutes
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return who is ignored."""
+        return self.ignored_attributes()
+
 
 class GroupNearHomeSensor(GroupEntity, SensorEntity):
     """The highest near home of any member, 0-100 %; 100 % while anyone is home.
+
+    Ignored members are left out; 0 % when every member is ignored.
 
     Each member's near home uses their own radius, so the member it shows is
     not always the one nearest.
@@ -435,9 +445,14 @@ class GroupNearHomeSensor(GroupEntity, SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        """Return the percentage, None while nobody's whereabouts are known."""
-        near = self._runtime.view.near
-        return None if near is None else _percent(near.value)
+        """Return the percentage, None while nobody's whereabouts are known.
+
+        0 when every member is ignored: nobody counted is near.
+        """
+        view = self._runtime.view
+        if view.near is None:
+            return 0 if view.everyone_ignored else None
+        return _percent(view.near.value)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -448,4 +463,5 @@ class GroupNearHomeSensor(GroupEntity, SensorEntity):
             "person_name": None if near is None else near.name,
             "distance_m": None if near is None else round(near.distance_m),
             "persons_home": list(self._runtime.view.persons_home),
+            **self.ignored_attributes(),
         }

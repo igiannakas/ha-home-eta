@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.core import callback
 from homeassistant.helpers.entity import Entity
 
@@ -37,7 +39,10 @@ class PersonEntity(Entity):
 
 
 class GroupEntity(Entity):
-    """An entity fed by a group runtime."""
+    """An entity fed by a group runtime.
+
+    Its attributes say who the group ignores (see :meth:`ignored_attributes`).
+    """
 
     _attr_has_entity_name = True
     _attr_should_poll = False
@@ -57,3 +62,11 @@ class GroupEntity(Entity):
     @callback
     def _handle_update(self) -> None:
         self.async_write_ha_state()
+
+    def ignored_attributes(self) -> dict[str, Any]:
+        """Return the members the group leaves out, by entity id and by name."""
+        view = self._runtime.view
+        return {
+            "ignored": list(view.ignored),
+            "ignored_names": list(view.ignored_names),
+        }

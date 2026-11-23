@@ -1,0 +1,36 @@
+ignore_members_at_home:
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: home_eta
+    members:
+      example: person.vasiliki
+      selector:
+        entity:
+          filter:
+            domain: person
+          multiple: true
+    reason:
+      default: by_hand
+      selector:
+        select:
+          translation_key: reason
+          options:
+            - by_hand
+            - away_pressed
+            - stale
+
+stop_ignoring:
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: home_eta
+    members:
+      example: person.vasiliki
+      selector:
+        entity:
+          filter:
+            domain: person
+          multiple: true
